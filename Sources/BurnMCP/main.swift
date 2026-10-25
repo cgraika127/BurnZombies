@@ -54,8 +54,9 @@ import MCP
       guard params.name == "tame_the_horde" else { throw MCPError.invalidParams("Unknown prompt.") }
       return .init(description: "Tame the horde", messages: [.user(.text(text: "Use BurnZombies to check buildup. Preview and burn eligible abandoned helpers, preserving active and uncertain work. Report pending versus verified results honestly. If nothing qualifies, say so."))])
     }
-    // The installed server starts the menu bar app if needed. No shell or package runtime.
-    if ProcessInfo.processInfo.environment["BURNZOMBIES_HOME"] == nil {
+    // Reopening a running app raises its popover. Connect quietly when it is already available.
+    if ProcessInfo.processInfo.environment["BURNZOMBIES_HOME"] == nil,
+      !AgentConnection.isAvailable() {
       let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
       let app = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
       if app.pathExtension == "app" {

@@ -72,6 +72,83 @@ func autopilotPolicyProof() throws {
     AutopilotPolicy.widen(["stale": ["day"]], verdict: .burn)["stale"],
     ["day", "week", "month", "older"], "a yes also covers copies left longer")
 
+  // Only things worth it are assessed: 100 MB or more, or a program keeping a CPU busy.
+  check(AutopilotPolicy.worthAssessing(copy("big", [:], bytes: 150_000_000)), "150 MB copy")
+  checkFalse(AutopilotPolicy.worthAssessing(copy("small", [:], bytes: 20_000_000)), "20 MB copy")
+  checkFalse(AutopilotPolicy.worthAssessing(copy("unmeasured", [:], bytes: 0)), "unmeasured copy")
+  checkFalse(AutopilotPolicy.worthAssessing(junk("crumbs", [:], bytes: 99_000_000)), "99 MB folder")
+  checkFalse(
+    AutopilotPolicy.worthAssessing(process("calm", ["cpu": "calm"], bytes: 30 << 20)),
+    "small quiet program")
+  check(
+    AutopilotPolicy.worthAssessing(process("hot", ["cpu": "busy"], bytes: 30 << 20)),
+    "small program keeping a CPU busy")
+
+  // Questions go where the space is, and a pattern freeing under 1 GB isn't worth one.
+  let finishedFacts = [
+    "place": "sibling", "saved": "merged", "changes": "none", "stale": "month", "thread": "none",
+  ]
+  var pushedFacts = finishedFacts
+  pushedFacts["saved"] = "pushed"
+  let many = (0..<30).map { copy("many\($0)", finishedFacts, bytes: 150_000_000) }
+  let few = (0..<2).map { copy("few\($0)", pushedFacts, bytes: 5_000_000_000) }
+  let crumbs = (0..<5).map {
+    junk("crumbs\($0)", ["folder": "node_modules", "home": "repo", "stale": "month"], bytes: 150_000_000)
+  }
+  // A question reads as a short headline, what it frees, a few short facts and one line
+  // of reassurance: little to read and easy to decide.
+  let agentCopies = AutopilotQuestion(
+    kind: .worktree, match: ["saved": ["pushed"], "stale": ["week"], "place": ["patrol6"]],
+    question: "Can I burn old project copies made by Patrol6 agents?", why: "", examples: [],
+    count: 92, bytes: 14_390_000_000)
+  let copiesCard = AutopilotPolicy.card(agentCopies)
+  equal(copiesCard.headline, "Burn 92 old project copies?")
+  equal(copiesCard.frees, "Frees 14.4 GB")
+  equal(copiesCard.facts, ["Saved on GitHub", "Unused for a week", "Made by Patrol6 agents"])
+  equal(copiesCard.note, "Each one is backed up first, so you can undo it.")
+  equal([copiesCard.yes, copiesCard.no], ["Yes, burn them", "No, keep them"])
+  equal(copiesCard.cautions, [], "nothing risky about pushed copies left a week")
+  let draftCopies = AutopilotQuestion(
+    kind: .worktree, match: ["saved": ["local"], "changes": ["small"], "stale": ["day"]],
+    question: "", why: "", examples: [], count: 2, bytes: 57_300_000_000)
+  equal(
+    AutopilotPolicy.card(draftCopies).cautions,
+    ["Work only on this Mac", "Has unsaved changes", "Unused since yesterday"],
+    "what makes burning riskier stands out")
+  let lonelyServer = AutopilotQuestion(
+    kind: .process, match: ["family": ["node"], "idle": ["1d"], "listening": ["yes"]],
+    question: "", why: "", examples: [], count: 1, bytes: 3_200_000_000)
+  let serverCard = AutopilotPolicy.card(lonelyServer)
+  equal(serverCard.headline, "Burn 1 leftover Node program?")
+  equal(serverCard.frees, "Frees 3.2 GB of memory")
+  equal(serverCard.facts, ["Still running a server", "Idle 1+ day"])
+  equal(serverCard.note, "It just gets asked to quit.")
+  equal([serverCard.yes, serverCard.no], ["Yes, burn it", "No, keep it"])
+  let caches = AutopilotQuestion(
+    kind: .disk, match: ["folder": ["package-cache"], "home": ["global-cache"], "stale": ["day"]],
+    question: "", why: "", examples: [], count: 5, bytes: 20_290_000_000)
+  let cachesCard = AutopilotPolicy.card(caches)
+  equal(cachesCard.headline, "Burn 5 tool caches?")
+  equal(cachesCard.facts, ["Unused since yesterday"])
+  equal(cachesCard.note, "Your tools rebuild them when needed.")
+  equal(
+    AutopilotPolicy.ruleTitle(agentCopies, answer: .yes),
+    "Burn: Old project copies · Saved on GitHub · Unused for a week · Made by Patrol6 agents")
+  equal(
+    AutopilotPolicy.ruleTitle(lonelyServer, answer: .no),
+    "Keep: Leftover Node programs · Still running a server · Idle 1+ day")
+  let modules = AutopilotQuestion(
+    kind: .disk, match: ["folder": ["node_modules"], "stale": ["day"], "home": ["repo"]],
+    question: "", why: "", examples: [], count: 9, bytes: 4_000_000_000)
+  equal(
+    AutopilotPolicy.ruleTitle(modules, answer: .yes),
+    "Burn: node_modules folders · Unused since yesterday · Inside your projects",
+    "a folder's real name keeps its case")
+
+  let valued = AutopilotPolicy.proposeQuestions(many + few + crumbs, memory: AutopilotMemory())
+  equal(valued.first?.match["saved"], ["pushed"], "two 5 GB copies beat thirty 150 MB ones")
+  checkFalse(valued.contains { $0.kind == .disk }, "750 MB of folders isn't worth a question")
+
   // Keep beats burn, for rules and for the operator's own keeps.
   let burnAll = AutopilotRule(
     kind: .process, match: ["family": ["node"]], verdict: .burn, source: .operator,
@@ -148,7 +225,7 @@ func autopilotPolicyProof() throws {
         [
           "family": "python", "orphaned": "yes", "thread": "none", "idle": "1h",
           "listening": "yes", "agent": "none",
-        ]))
+        ], bytes: 200 << 20))
   }
   for i in 0..<5 {
     unsure.append(junk("cache-\(i)", ["folder": "package-cache", "home": "repo", "stale": "week"]))

@@ -4,6 +4,7 @@ import Darwin
 import Foundation
 
 func diskDiscoveryProof() throws {
+  try diskSelectionScaleProof()
   try toolCaptureProof()
   try diskPermissionPreflightProof()
   let base = URL(
@@ -69,17 +70,19 @@ func diskDiscoveryProof() throws {
   check(linked.hardlinks >= 2, "Hardlinks must be identified")
   equal(linked.unshared, 0)
 
-  // A compact 15 GB simulated measurement uses tiny real files; never allocate fake GB.
+  // A compact 150 MB simulated measurement uses tiny real files; never allocate fake GB.
   for i in measured.indices {
-    measured[i].allocated = measured[i].path == home.path ? 15_000_000_000 : 5_000_000_000
+    measured[i].allocated = measured[i].path == home.path ? 150_000_000 : 50_000_000
     measured[i].unshared = measured[i].allocated
   }
   let store = try Store(root: base.appendingPathComponent("state"))
   var saved = DiskDiscoveryState()
   saved.nodes = measured
   try saved.save(store)
-  let discovery = try DiskDiscovery(store: store, roots: [home.path],
-    walker: DiskWalkRunner(executable: URL(fileURLWithPath: CommandLine.arguments[0]),
+  let discovery = try DiskDiscovery(
+    store: store, roots: [home.path],
+    walker: DiskWalkRunner(
+      executable: URL(fileURLWithPath: CommandLine.arguments[0]),
       argumentPrefix: ["--disk-walk-worker"]),
     accessCheck: { .init(state: .granted, detail: "Isolated fixture") })
   equal(
@@ -95,7 +98,7 @@ func diskDiscoveryProof() throws {
   else {
     throw StoreError.message("Repeated output grouping missing")
   }
-  equal(group.allocated, 15_000_000_000)
+  equal(group.allocated, 150_000_000)
   equal(group.folders, 3)
   let encoded = try JSONEncoder().encode(inspected)
   check(encoded.count < 12_000, "Bounded model evidence must not include every group member")
@@ -194,8 +197,10 @@ func diskDiscoveryProof() throws {
 }
 
 private func diskPermissionPreflightProof() throws {
-  let root = URL(fileURLWithPath: WorkspaceSafety.canonical(FileManager.default.temporaryDirectory.path))
-    .appendingPathComponent("bz-permission-walk-" + UUID().uuidString)
+  let root = URL(
+    fileURLWithPath: WorkspaceSafety.canonical(FileManager.default.temporaryDirectory.path)
+  )
+  .appendingPathComponent("bz-permission-walk-" + UUID().uuidString)
   let denied = root.appendingPathComponent("denied")
   let visible = root.appendingPathComponent("visible")
   try FileManager.default.createDirectory(at: denied, withIntermediateDirectories: true)
@@ -326,4 +331,74 @@ func moleIntegrationProof() throws {
   print(
     "PASS installed Mole: real JSON, bounded run, source unchanged, cache reuse, protected and linked branches refused"
   )
+}
+
+func diskSelectionScaleProof() throws {
+  var state = DiskDiscoveryState()
+  let measured = Date(timeIntervalSince1970: 1)
+  state.nodes = (0..<12000).map { index in
+    DiskSpaceNode(
+      path: "/synthetic-storage/folder-\(index)", scanRoot: "/synthetic-storage",
+      allocated: index < 453 ? DiskCandidate.minimumReviewBytes : 1,
+      unshared: index < 453 ? DiskCandidate.minimumReviewBytes : 1,
+      files: 1, complete: true, measured: measured)
+  }
+  let began = ProcessInfo.processInfo.systemUptime
+  let opportunities = state.opportunities
+  let elapsed = ProcessInfo.processInfo.systemUptime - began
+  equal(opportunities.count, 453, "Disjoint large branches must all remain available")
+  check(elapsed < 1, "12,000-node storage projection blocked observation for \(elapsed) seconds")
+  print("Storage selection: 12000 measured nodes,453 eligible, \(elapsed) seconds")
+
+  func legacy(_ value: DiskDiscoveryState) -> [String] {
+    let eligible = value.nodes.filter {
+      $0.complete && $0.allocated >= DiskCandidate.minimumReviewBytes
+    }
+    let groups = eligible.filter {
+      $0.members != nil && value.advice[$0.id]?.revision == $0.revision
+    }
+    return eligible.filter { node in
+      if node.members != nil { return groups.contains { $0.id == node.id } }
+      if groups.contains(where: { group in
+        (group.members ?? []).contains {
+          WorkspaceSafety.contains(node.path, $0) || WorkspaceSafety.contains($0, node.path)
+        }
+      }) {
+        return false
+      }
+      return !eligible.contains {
+        $0.id != node.id && $0.members == nil && node.members == nil
+          && WorkspaceSafety.contains(node.path, $0.path)
+      }
+    }.sorted { a, b in
+      a.unshared == b.unshared ? a.allocated > b.allocated : a.unshared > b.unshared
+    }.map(\.id)
+  }
+  var cases = DiskDiscoveryState()
+  cases.nodes = [
+    "/map/root", "/map/root/child", "/map/root-other", "/map/other/a", "/map/other/b", "/map/empty",
+  ].enumerated().map { index, path in
+    DiskSpaceNode(
+      path: path, scanRoot: "/map", allocated: 500_000_000 + UInt64(index),
+      unshared: 400_000_000 + UInt64(index), files: 1, complete: true, measured: measured)
+  }
+  var group = cases.nodes[3]
+  group.path = "/map/outputs"
+  group.members = [cases.nodes[3].path, cases.nodes[4].path]
+  cases.nodes += [group, cases.nodes[2]]
+  for approved in [false, true] {
+    if approved {
+      cases.advice[group.id] = DiskAdvice(
+        id: group.id, revision: group.revision, title: "Synthetic",
+        summary: "Fixture grouping", nextStep: "Review only", disposition: "rebuildable",
+        date: measured)
+    }
+    equal(
+      cases.opportunities.map(\.id), legacy(cases),
+      "Cached storage identity changed nesting, prefix, duplicate or group selection semantics")
+  }
+  cases.advice[group.id]?.revision = "stale"
+  cases.nodes[0].complete = false
+  equal(
+    cases.opportunities.map(\.id), legacy(cases), "Stale group advice changed storage selection")
 }

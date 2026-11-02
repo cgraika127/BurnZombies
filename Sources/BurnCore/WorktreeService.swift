@@ -6,6 +6,7 @@ import Foundation
 /// One authority for inventory, policy, claims and worktree operations.
 public actor WorktreeService {
   let store: WorktreeStore
+  let intent: IntentLedger?
   let visibility: @Sendable (String) -> Int32
   let access: @Sendable () -> FullDiskAccessStatus
   let recoveryKey: @Sendable () throws -> SymmetricKey
@@ -13,6 +14,7 @@ public actor WorktreeService {
   let interactiveRecoveryKey: @Sendable () throws -> SymmetricKey
   let interactiveExistingKey: @Sendable () throws -> SymmetricKey
   let scanRunner: WorktreeScanRunner?
+  let discoveryHome: URL?
   var scanControl: WorktreeScanControl?
   var plans: [String: WorktreePlan] = [:]
   var batches: [String: (String, [WorktreePlan])] = [:]
@@ -25,16 +27,22 @@ public actor WorktreeService {
   var scanning: Bool { scanFlight != nil }
   var executing = false
   var lastScan = Date.distantPast
+  var refreshingFindings = false
+  var refreshCohort = 0
   var scanGaps: [String] = []
   var closing = false
   var workJobs: [UUID: @Sendable () -> Void] = [:]
   public init(
-    root: URL, visibility: (@Sendable (String) -> Int32)? = nil,
+    legacyAuthority: Bool = false, root: URL, visibility: (@Sendable (String) -> Int32)? = nil,
     access: @escaping @Sendable () -> FullDiskAccessStatus = { FullDiskAccess.status() },
     recoveryKey: (@Sendable () throws -> SymmetricKey)? = nil, legacy: [WorkspaceClaim] = [],
-    scanRunner: WorktreeScanRunner? = nil
+    scanRunner: WorktreeScanRunner? = nil, discoveryHome: URL? = nil, intent: IntentLedger? = nil
   ) throws {
     self.store = try WorktreeStore(root: root)
+    // Monitor owns the shared gate. A failed gate must not be reopened with a
+    // different authority contract. Standalone native fixtures opt in explicitly.
+    self.intent =
+      try intent ?? (legacyAuthority ? IntentLedger(root: root, legacyAuthority: true) : nil)
     self.visibility = visibility ?? { bz_path_in_use($0) }
     self.access = access
     self.recoveryKey = recoveryKey ?? { try WorktreeRecoveryKey.load() }
@@ -44,6 +52,10 @@ public actor WorktreeService {
     self.interactiveExistingKey =
       recoveryKey ?? { try WorktreeRecoveryKey.load(create: false, allowInteraction: true) }
     self.scanRunner = scanRunner ?? (visibility == nil ? WorktreeScanRunner() : nil)
+    self.discoveryHome = discoveryHome
+    if let home = discoveryHome {
+      try Self.seedRoots(store: store, home: home)
+    }
     if !legacy.isEmpty {
       try store.put("pending", kind: "migration", id: "legacy")
       for old in legacy where old.state != "cleaned" { try Self.importLegacy(old, into: store) }
@@ -55,6 +67,10 @@ public actor WorktreeService {
       "uncertain",
     ].contains(operation.phase) {
       operation.interruptedPhase = operation.phase
+      if operation.finishPhase == "prepared" {
+        operation.finishPhase = "uncertain"
+        if let id = operation.finishID { operation.finishHistory?[id] = "uncertain" }
+      }
       operation.phase = "uncertain"
       operation.diskCredit = 0
       operation.detail =
@@ -67,6 +83,18 @@ public actor WorktreeService {
       attempt.detail =
         "Restoration interrupted; inspect the partial destination. Original archive retained."
       try store.put(attempt, kind: "restore", id: attempt.id)
+    }
+    // Native restore requests survive even when BOTH feedback storage and its
+    // fallback latch fail (e.g. a full disk). Rehydrate the veto on every launch.
+    for attempt in try store.values(WorktreeRestoreAttempt.self, kind: "restore") {
+      if let op = try store.value(
+        WorktreeOperation.self, kind: "operation", id: attempt.recoveryID),
+        let row = try store.value(WorktreeRecord.self, kind: "record", id: op.worktreeID)
+      {
+        _ = self.intent?.recordRecovery(
+          operationID: op.id, fallback: CleanupProposal.worktree(row, ready: false),
+          attemptID: attempt.id)
+      }
     }
     for var op in try store.values(WorktreeOperation.self, kind: "operation")
     where op.purgePending == true {
@@ -84,9 +112,64 @@ public actor WorktreeService {
       }
     }
   }
+  public func replayRecoveryFeedback() throws {
+    let ledger = try intentLedger()
+    let attempts = try store.values(WorktreeRestoreAttempt.self, kind: "restore")
+    for attempt in attempts {
+      guard
+        let op = try store.value(WorktreeOperation.self, kind: "operation", id: attempt.recoveryID),
+        let row = try store.value(WorktreeRecord.self, kind: "record", id: op.worktreeID),
+        ledger.recordRecovery(
+          operationID: op.id, fallback: CleanupProposal.worktree(row, ready: false),
+          attemptID: attempt.id) == nil
+      else {
+        throw StoreError.message(
+          "Native recovery feedback cannot yet be saved. Cleanup remains suspended.")
+      }
+    }
+  }
+  private static func seedRoots(store: WorktreeStore, home: URL) throws {
+    var policy =
+      try store.value(WorktreePolicy.self, kind: "policy", id: "current") ?? WorktreePolicy()
+    let old = policy.revision
+    let diskRoots =
+      FileManager.default.fileExists(
+        atPath: store.root.appendingPathComponent("disk-policy.json").path)
+      ? ((try? DiskPolicy.load(Store(root: store.root)).roots) ?? []) : []
+    let known = [
+      ".codex/worktrees", ".claude/worktrees", ".cursor/worktrees", ".patrol6/worktrees", "git",
+      "Developer",
+    ]
+    .map { home.appendingPathComponent($0).path }
+    for path in diskRoots + known {
+      let canonical = WorkspaceSafety.canonical(path)
+      var directory: ObjCBool = false
+      if policy.roots.count < 32, !(policy.removedDiscoveryRoots ?? []).contains(canonical),
+        FileManager.default.fileExists(atPath: canonical, isDirectory: &directory),
+        directory.boolValue,
+        canonical != home.path, canonical != "/",
+        !policy.roots.contains(where: { WorkspaceSafety.contains($0, canonical) })
+      {
+        policy.roots.append(canonical)
+      }
+    }
+    policy.discoveryVersion = 2
+    try policy.validate()
+    if policy.revision != old { try store.put(policy, kind: "policy", id: "current") }
+  }
+  func refreshDiscoveryRoots() throws {
+    if let home = discoveryHome { try Self.seedRoots(store: store, home: home) }
+  }
   func requireAccess() throws {
     let a = access()
     guard a.canScan else { throw StoreError.message(a.detail) }
+  }
+  func intentLedger() throws -> IntentLedger {
+    guard let intent else {
+      throw StoreError.message(
+        "Cleanup decision store unavailable. Observation and recovery remain available.")
+    }
+    return intent
   }
   func records() throws -> [WorktreeRecord] {
     try store.values(WorktreeRecord.self, kind: "record")
@@ -110,6 +193,28 @@ public actor WorktreeService {
   func claimRevision(_ id: String) throws -> String {
     WorkEvidence.hash(try WorktreeEncoding.data(claims(id)).base64EncodedString())
   }
+  func proposal(_ row: WorktreeRecord, ready: Bool) throws -> CleanupProposal {
+    var value = CleanupProposal.worktree(row, ready: ready)
+    let owners = try claims(row.id)
+    let released =
+      !owners.isEmpty
+      && owners.allSatisfy {
+        $0.state == "released" && $0.head == row.head && $0.releasedRevision == row.revision
+      }
+    let staleDays = try policy().staleDays
+    value.notificationEligible =
+      released || row.confirmedRevision == row.revision
+      || (row.apparentIdleDays ?? 0) >= staleDays
+      || Date().timeIntervalSince(row.changedAt) >= Double(staleDays) * 86400
+    value.nativeRevision = row.revision
+    value.revision = WorkEvidence.hash(
+      try [
+        row.revision, claimRevision(row.id), policy().authorityRevision,
+        WorktreeEncoding.data(row.identity).base64EncodedString(), row.consumer,
+        String(row.managed), String(row.kept), row.confirmedRevision ?? "",
+      ].joined(separator: "|"))
+    return value
+  }
   func publish(_ inspected: WorktreeRecord) throws -> WorktreeRecord {
     var r = inspected
     let alias =
@@ -127,9 +232,21 @@ public actor WorktreeService {
       }
       r.id = old.id
       if !r.missing && r.gaps == ["Detailed inspection pending."] && r.revision.isEmpty
-        && !old.revision.isEmpty && r.head == old.head
+        && !old.revision.isEmpty && r.head == old.head && r.branch == old.branch
+        && r.locked == old.locked && r.main == old.main && r.bare == old.bare
+        && r.ownerManaged == old.ownerManaged && r.missing == old.missing
       {
-        return old
+        // Registration confirms topology, not new inspection evidence. Preserve
+        // the previous observation; known refresh and action-time inspection
+        // own freshness. A late stub must not degrade a completed observation.
+        var previous = old
+        // Older builds appended this registration-only marker to inspected
+        // rows. Repair that marker without refreshing time or clearing a real gap.
+        previous.gaps.removeAll { $0 == "Detailed inspection pending." }
+        if previous.gaps != old.gaps {
+          try store.put(previous, kind: "record", id: previous.id)
+        }
+        return previous
       }
       if old.observedAt > r.observedAt { return old }
       r.firstSeen = old.firstSeen
@@ -147,11 +264,16 @@ public actor WorktreeService {
       r.consumer = "in use"
       r.blockers.append("\(active.count) owner claim(s) retain this worktree.")
     }
+    r.blockers = Array(Set(r.blockers)).sorted()
     r.readinessRevision = WorkEvidence.hash(
       r.consumer + "|" + r.blockers.sorted().joined(separator: "|") + "|"
         + r.gaps.sorted().joined(separator: "|"))
     try store.put(r, kind: "record", id: r.id)
     return r
+  }
+  /// Every stored worktree record, for Autopilot's catalog. Read-only.
+  public nonisolated func autopilotRecords() -> [WorktreeRecord] {
+    (try? store.values(WorktreeRecord.self, kind: "record", limit: 50_000)) ?? []
   }
   public func inspect(_ id: String) async throws -> WorktreeRecord {
     try requireAccess()
@@ -204,7 +326,11 @@ public actor WorktreeService {
       let control = WorktreeScanControl()
       scanControl = control
       let root = store.root
-      let cursor = try store.value(Int.self, kind: "scan", id: "cursor") ?? 0
+      // Earlier releases indexed every registration in repository order. The
+      // new cursor indexes only the fair detail queue; migrate it once.
+      let cursor =
+        try store.value(Int.self, kind: "scan", id: "cursor-version") == 2
+        ? store.value(Int.self, kind: "scan", id: "cursor") ?? 0 : 0
       result = try await runWork {
         runner.run(
           roots: roots, root: root, inspectOffset: cursor,
@@ -219,9 +345,13 @@ public actor WorktreeService {
     }
     for row in result.records { _ = try publish(row) }
     // Missing discoveries are not tombstoned merely because a scan is partial.
-    try store.put(result.nextInspection, kind: "scan", id: "cursor")
+    try store.transaction {
+      try store.put(result.nextInspection, kind: "scan", id: "cursor")
+      try store.put(2, kind: "scan", id: "cursor-version")
+    }
     scanGaps = result.gaps
     lastScan = Date()
+    try store.put(lastScan, kind: "scan", id: "last")
     var reply = try snapshot()
     reply.gaps = result.gaps
     return reply
@@ -242,11 +372,66 @@ public actor WorktreeService {
       }
     }
     var reply = WorktreeReply()
+    reply.policy = try policy()
+    let privateRoot = store.root.appendingPathComponent("workspaces").path
+    let inventory = try records().filter { r in
+      reply.policy.roots.contains { WorkspaceSafety.contains($0, r.path) }
+        || WorkspaceSafety.contains(privateRoot, r.path)
+    }.sorted { $0.path < $1.path }
+    reply.totalRecords = inventory.count
+    if let intent {
+      reply.intentError = intent.suspensionReason
+      do {
+        var proposals: [CleanupProposal] = []
+        for row in inventory where !row.main && !row.bare && !row.retired {
+          let ready = (try? eligibleForDecision(row)) != nil
+          proposals.append(try proposal(row, ready: ready))
+        }
+        try intent.presentMany(proposals)
+        for operation in try store.values(WorktreeOperation.self, kind: "operation")
+        where ["completed", "quarantined", "failed", "refused", "uncertain", "reconciled-absent"]
+          .contains(operation.phase)
+        {
+          try intent.project(
+            operationID: operation.id,
+            outcome: operation.phase == "completed"
+              ? "verified"
+              : operation.phase == "quarantined"
+                ? "quarantined"
+                : operation.phase == "failed" || operation.phase == "refused"
+                  ? "refused" : "uncertain")
+          if let finish = operation.finishPhase,
+            ["verified", "refused", "uncertain", "reconciled"].contains(finish)
+          {
+            try intent.project(
+              operationID: operation.finishID ?? operation.id + ":finish", outcome: finish)
+          } else if operation.phase == "completed" {
+            try intent.project(operationID: operation.id + ":finish", outcome: "verified")
+          }
+          for (id, phase) in operation.finishHistory ?? [:]
+          where ["verified", "refused", "uncertain", "reconciled"].contains(phase) {
+            try intent.project(operationID: id, outcome: phase)
+          }
+        }
+      } catch {
+        reply.intentError =
+          "Cleanup decisions unavailable; inventory and recovery remain available. "
+          + error.localizedDescription
+      }
+    } else {
+      reply.intentError = "Cleanup decision store unavailable; cleanup is blocked."
+    }
+    reply.stateCounts = Dictionary(grouping: inventory, by: \.state).mapValues(\.count)
+    reply.lastScan = try store.value(Date.self, kind: "scan", id: "last")
+    reply.scanning = scanning
     let rows =
       try selectedIDs.map { try $0.map { try record($0) } }
-      ?? store.page(WorktreeRecord.self, kind: "record", offset: offset, limit: 101)
+      ?? Array(inventory.dropFirst(offset).prefix(101))
     reply.records = Array(rows.prefix(100))
-    reply.policy = try policy()
+    if reply.policy.roots.isEmpty {
+      reply.detail =
+        "No discovery folders configured. Add a repository or development folder; cleanup permission is separate."
+    }
     reply.suggestedRoots = (try store.value([String].self, kind: "suggestions", id: "roots") ?? [])
       .filter { !reply.policy.roots.contains($0) }
     let operations = try store.page(
@@ -428,8 +613,10 @@ public actor WorktreeService {
       if q.action == "add_root" {
         guard p.roots.count < 32 else { throw StoreError.message("Discovery root limit reached.") }
         if !p.roots.contains(path) { p.roots.append(path) }
+        p.removedDiscoveryRoots?.removeAll { $0 == path }
       } else {
         p.roots.removeAll { $0 == path }
+        p.removedDiscoveryRoots = Array(Set((p.removedDiscoveryRoots ?? []) + [path])).sorted()
       }
       generation += 1
       scanControl?.cancel()
@@ -439,6 +626,12 @@ public actor WorktreeService {
       return try snapshot(selectedIDs: [r.id])
     case "keep", "unkeep", "adopt", "confirm":
       var r = try expected(q)
+      if ["keep", "unkeep"].contains(q.action) {
+        let ledger = try intentLedger()
+        let p = try ledger.present(proposal(r, ready: false))
+        try ledger.decide(
+          p.id, revision: p.revision, decision: q.action == "keep" ? "keep" : "clear-keep")
+      }
       if q.action == "keep" {
         r.kept = true
         r.confirmedRevision = nil
@@ -463,6 +656,11 @@ public actor WorktreeService {
         try store.put(evidence, kind: "decision", id: r.id)
       }
       try store.put(r, kind: "record", id: r.id)
+      if q.action == "confirm", (try? eligible(r, dirty: true, automatic: false)) != nil {
+        let ledger = try intentLedger()
+        let p = try ledger.present(proposal(r, ready: true))
+        try ledger.decide(p.id, revision: p.revision, decision: "approve", reason: q.evidence ?? "")
+      }
       plans = [:]
     case "claim":
       let r = try expected(q)
@@ -516,6 +714,7 @@ public actor WorktreeService {
       p.automaticRepositories.removeAll { $0 == r.repository }
       if enabled { p.automaticRepositories.append(r.repository) }
       try store.put(p, kind: "policy", id: "current")
+      try intentLedger().authorizeNativeWorktreePolicy(p)
       plans = [:]
     case "preview", "preview_dirty":
       let plan = try await preview(

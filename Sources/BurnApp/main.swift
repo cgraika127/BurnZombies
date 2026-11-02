@@ -144,6 +144,16 @@ import UserNotifications
   }
 
   func requestAgentCleanup() {
+    if let runtime = autopilotRuntime {
+      guard harnessConfigured else {
+        message = "Choose Claude Code or Codex in Settings so BZ can think through new things."
+        return
+      }
+      message = "Hunting now. I'll burn what's safe and ask if I'm unsure."
+      openHunt?()
+      Task { autopilot = await runtime.tick(manual: true) }
+      return
+    }
     guard accessReady else {
       message = state.fullDiskAccess.detail
       return
@@ -248,12 +258,33 @@ import UserNotifications
   var openAudit: (() -> Void)?
   var openWorktrees: (() -> Void)?
   var openHunt: (() -> Void)?
+  var openFindings: (() -> Void)?
+  var openAdvancedFindings: (() -> Void)?
+  var openTeach: (() -> Void)?
+  var openWorktreeID: ((String) -> Void)?
+  /// Autopilot as the windows see it. The engine replaces this after every sweep and command.
+  @Published var autopilot = AutopilotSnapshot()
+  /// Applies one operator command in the engine and returns the new snapshot. While nil (demo and
+  /// offscreen proofs) the model applies the same change to `autopilot` in memory instead.
+  var autopilotRunner: ((AutopilotCommand) async -> AutopilotSnapshot?)?
+  /// The Autopilot surfaces appear once an engine is attached, or in the demo.
+  var autopilotAvailable: Bool { demo || autopilotRunner != nil }
+  @Published var findingSelection: String?
+  @Published var findingBusy = Set<String>()
   let demo: Bool
   private var monitor: Monitor?
   private var agentListener: AgentListener?
   private var agentSnapshotTask: Task<Void, Never>?
   private var reviewer: MachineReviewer?
+  private var autopilotRuntime: AutopilotRuntime?
   private var timer: Timer?
+  private var observationSuspended = false
+  private var observationStopped = false
+  private var notificationPermissionError: String?
+  private var notificationDeliveryInFlight = false
+  #if DEBUG
+    private var timerDispatchForProof: (() -> Void)?
+  #endif
   var onUpdate: (() -> Void)?
   init(
     demo: Bool = CommandLine.arguments.contains("--demo"), accessPreferences: UserDefaults? = nil,
@@ -271,6 +302,7 @@ import UserNotifications
     if demo {
       state = Demo.state()
       state.fullDiskAccess = .init(state: .granted, detail: "Preview access state.")
+      autopilot = Demo.autopilot()
       pressure = "Low"
       harnessConfigured = true
       machineReviewEnabled = true
@@ -287,12 +319,21 @@ import UserNotifications
         prepareHunt: { _ = try await observer.prepareHunt() },
         settleHunt: { _ = try await observer.settleHuntDiscovery() })
       reloadReviewConfiguration()
+      if let runtime = try? AutopilotRuntime(monitor: observer) {
+        autopilotRuntime = runtime
+        autopilotRunner = { [weak self] command in
+          do { return try await runtime.run(command) } catch {
+            self?.message = error.localizedDescription
+            return nil
+          }
+        }
+      }
     } catch {
       state.error = error.localizedDescription
       return
     }
     if let monitor {
-      let service = AgentService(monitor: monitor)
+      let service = AgentService(monitor: monitor, autopilot: autopilotRuntime?.engine)
       do {
         agentListener = try AgentListener { [weak self] request in
           let reply = await service.call(request)
@@ -310,6 +351,125 @@ import UserNotifications
     let reply = try await monitor.worktreeRequest(request, caller: "native-operator")
     if !["list", "operations"].contains(request.action) { state = await monitor.snapshot() }
     return reply
+  }
+  func decideFinding(_ p: CleanupProposal, decision: String, reason: String = "") {
+    guard let monitor else { return }
+    Task {
+      findingBusy.insert(p.id)
+      defer { findingBusy.remove(p.id) }
+      do {
+        try await monitor.decideFinding(
+          p.id, revision: p.revision, decision: decision, reason: reason)
+        state = await monitor.snapshot()
+        if decision == "approve" {
+          message = try await monitor.executeApprovedFinding(p.id, revision: p.revision)
+        } else {
+          message = decision == "keep" ? "Kept until you clear this decision." : "Decision saved."
+        }
+      } catch { message = error.localizedDescription }
+      state = await monitor.snapshot()
+    }
+  }
+  func grantRule(_ p: CleanupProposal, cap: Int, expires: Date, shadow: Bool = false) {
+    guard let monitor else { return }
+    Task {
+      do {
+        try await monitor.grantFindingRule(
+          p.id, revision: p.revision, maximumPerDay: cap, expires: expires, shadow: shadow)
+      } catch { message = error.localizedDescription }
+      state = await monitor.snapshot()
+    }
+  }
+  func refreshFinding(_ id: String) async {
+    guard let monitor else { return }
+    do { try await monitor.refreshFinding(id) } catch { message = error.localizedDescription }
+    state = await monitor.snapshot()
+  }
+  func findingDetail(_ id: String) async -> CleanupProposal? {
+    guard let monitor else { return nil }
+    return try? await monitor.finding(id)
+  }
+  func findingPage(_ offset: Int) async -> FindingsSnapshot? {
+    guard let monitor else { return nil }
+    return try? await monitor.findingPage(offset: offset)
+  }
+  func findingHistory(_ workflow: String) async -> [CleanupDecision] {
+    guard let monitor else { return [] }
+    return (try? await monitor.findingHistory(workflow: workflow)) ?? []
+  }
+  func forgetWorkflow(_ workflow: String) {
+    guard let monitor else { return }
+    Task {
+      do { try await monitor.forgetFindingWorkflow(workflow) } catch {
+        message = error.localizedDescription
+      }
+      state = await monitor.snapshot()
+    }
+  }
+  func reconcileDisk(_ id: UUID, restore: Bool) {
+    guard let monitor else { return }
+    Task {
+      do { message = try await monitor.reconcileDisk(id, restore: restore) } catch {
+        message = error.localizedDescription
+      }
+      state = await monitor.snapshot()
+    }
+  }
+  func reconcileFindingFeedback() {
+    guard let monitor else { return }
+    Task {
+      do {
+        try await monitor.reconcileFindingFeedback()
+        message =
+          "Recovery feedback saved. Affected workflows remain paused pending explicit review."
+      } catch { message = error.localizedDescription }
+      state = await monitor.snapshot()
+    }
+  }
+  func setNotificationBudget(_ budget: Int) {
+    var p = state.catalog.preferences
+    p.notificationBudget = max(1, min(5, budget))
+    save(p)
+  }
+  func pauseRule(_ rule: CleanupRule) {
+    guard let monitor else { return }
+    Task {
+      do { try await monitor.pauseFindingRule(rule.id) } catch {
+        message = error.localizedDescription
+      }
+      state = await monitor.snapshot()
+    }
+  }
+  func notificationAction(id: String, revision: String, action: String) {
+    Task {
+      if let monitor { state = await monitor.snapshot() }
+      // These notifications are about the detailed inbox, so they open the advanced window.
+      if id == "digest" {
+        openAdvancedFindings?()
+        return
+      }
+      guard let monitor, let p = try? await monitor.finding(id), p.revision == revision else {
+        message = "That finding changed. Review its current evidence."
+        openAdvancedFindings?()
+        return
+      }
+      if action == "approve" || action == "keep" || action == "snooze" {
+        decideFinding(p, decision: action)
+      } else {
+        findingSelection = p.id
+        openAdvancedFindings?()
+      }
+    }
+  }
+  func setNotificationDetails(_ enabled: Bool) {
+    var p = state.catalog.preferences
+    p.notificationDetails = enabled
+    save(p)
+  }
+  func setDecisionSharing(_ enabled: Bool) {
+    var p = state.catalog.preferences
+    p.shareDecisionHistory = enabled
+    save(p)
   }
   deinit { agentSnapshotTask?.cancel() }
   private func requestAgentSnapshot() {
@@ -330,7 +490,7 @@ import UserNotifications
     schedule()
   }
   func refresh() {
-    guard !working, let monitor else { return }
+    guard !working, !observationSuspended, !observationStopped, let monitor else { return }
     working = true
     Task {
       _ = await monitor.refresh()
@@ -339,25 +499,52 @@ import UserNotifications
         atPath: Store.defaultRoot.appendingPathComponent("review-request").path)
       pressure = Native().memoryPressure()
       working = false
+      guard !observationSuspended, !observationStopped else { return }
       if let selected = selection { selection = state.findings.first { $0.id == selected.id } }
       if state.error == nil {
         do {
-          if let text = try await monitor.notificationSummary() {
-            let content = UNMutableNotificationContent()
-            content.title = "A little attention could help"
-            content.body = text
-            try await UNUserNotificationCenter.current().add(
-              UNNotificationRequest(identifier: "grouped-findings", content: content, trigger: nil))
+          if state.catalog.preferences.notifications {
+            try await deliverFindingNotification(
+              next: { try await monitor.findingNotification() },
+              send: { proposal in
+                try await FindingNotifications.deliver(
+                  proposal, details: self.state.catalog.preferences.notificationDetails == true)
+              },
+              record: { try await monitor.findingNotificationDelivered($0) })
           }
         } catch { message = "Notification delivery unavailable: \(error.localizedDescription)" }
 
       }
+      guard !observationSuspended, !observationStopped else { return }
       onUpdate?()
       schedule()
-      Task { await monitor.worktreeTick() }
-      // Observation continues on its own timer while a bounded review runs.
-      if accessReady && state.error == nil && !state.partial { runScheduledHunt() }
+      Task {
+        guard !observationSuspended, !observationStopped else { return }
+        await monitor.worktreeTick()
+      }
+      if let runtime = autopilotRuntime {
+        autopilot = await runtime.tick()
+      } else if accessReady && state.error == nil && !state.partial {
+        // Observation continues on its own timer while a bounded review runs.
+        runScheduledHunt()
+      }
     }
+  }
+  private func deliverFindingNotification(
+    next: () async throws -> CleanupProposal?,
+    send: (CleanupProposal) async throws -> Void,
+    record: (CleanupProposal) async throws -> Void
+  ) async throws {
+    guard !observationSuspended, !observationStopped, !notificationDeliveryInFlight else { return }
+    notificationDeliveryInFlight = true
+    defer { notificationDeliveryInFlight = false }
+    guard let proposal = try await next(), !observationSuspended, !observationStopped else {
+      return
+    }
+    try await send(proposal)
+    // A successful delivery must be recorded even if sleep/shutdown happened
+    // while the system notification service was answering.
+    try await record(proposal)
   }
   private func receiveReviewState(includeHunt: Bool = true) async {
     if let reviewer { machineReview = await reviewer.snapshot() }
@@ -369,25 +556,45 @@ import UserNotifications
       atPath: Store.defaultRoot.appendingPathComponent("review-request").path)
   }
   private func schedule() {
+    guard !observationSuspended, !observationStopped else { return }
+    let tolerance = min(10, state.interval / 6)
+    // Read-only agent traffic must never push observation or notification delivery
+    // into the future. A shorter verification cadence may bring it forward.
+    if let timer, timer.isValid,
+      timer.fireDate <= Date().addingTimeInterval(state.interval)
+    {
+      timer.tolerance = min(timer.tolerance, tolerance)
+      return
+    }
     timer?.invalidate()
     let next = Timer(timeInterval: state.interval, repeats: false) {
-      [weak self] _ in Task { @MainActor in self?.refresh() }
+      [weak self] _ in
+      Task { @MainActor in
+        #if DEBUG
+          self?.timerDispatchForProof?()
+        #endif
+        self?.refresh()
+      }
     }
-    next.tolerance = min(10, state.interval / 6)
+    next.tolerance = tolerance
     // MainActor execution does not select a Foundation run loop. Attach explicitly,
     // and keep observing during AppKit menu tracking and modal interactions.
     RunLoop.main.add(next, forMode: .common)
     timer = next
   }
   func shutdownWorktrees() async {
+    observationStopped = true
     timer?.invalidate()
     await monitor?.shutdownWorktrees()
   }
   func suspend() {
+    observationSuspended = true
     timer?.invalidate()
     Task { try? await monitor?.checkpoint() }
   }
   func wake() {
+    guard !observationStopped else { return }
+    observationSuspended = false
     Task {
       await monitor?.resetContinuity()
       refresh()
@@ -491,18 +698,29 @@ import UserNotifications
           let allowed = try await UNUserNotificationCenter.current().requestAuthorization(options: [
             .alert
           ])
-          var p = state.catalog.preferences
-          p.notifications = allowed
-          save(p)
-          if !allowed {
-            message = "Notifications remain off. You can allow them in System Settings."
-          }
-        } catch { message = error.localizedDescription }
+          applyNotificationAuthorization(allowed)
+        } catch {
+          notificationPermissionError = error.localizedDescription
+          message = notificationPermissionError
+        }
       }
     } else {
       var p = state.catalog.preferences
       p.notifications = enabled
       save(p)
+    }
+  }
+  private func applyNotificationAuthorization(_ allowed: Bool) {
+    var p = state.catalog.preferences
+    p.notifications = allowed
+    save(p)
+    if allowed {
+      if message == notificationPermissionError { message = nil }
+      notificationPermissionError = nil
+    } else {
+      notificationPermissionError =
+        "Notifications remain off. You can allow them in System Settings."
+      message = notificationPermissionError
     }
   }
   private func save(_ p: Preferences) {
@@ -534,6 +752,65 @@ import UserNotifications
       }
       objectWillChange.send()
     } catch { message = "Login item could not be changed: \(error.localizedDescription)" }
+  }
+  // MARK: Autopilot commands
+  // Each sends its AutopilotCommand through `autopilotRunner` and shows the snapshot it returns.
+  // With no runner (demo and offscreen proofs) the same change is applied in memory so the
+  // windows visibly react. A real model without a runner changes nothing and says so.
+  func answer(_ q: AutopilotQuestion, _ a: AutopilotAnswer) {
+    sendAutopilot(.answer(questionID: q.id, answer: a)) {
+      AutopilotLocal.answer(&$0, question: q, answer: a, now: Date())
+    }
+  }
+  func burnNow(_ e: AutopilotEntry) {
+    sendAutopilot(.burnNow(itemID: e.id)) { AutopilotLocal.burnNow(&$0, entry: e, now: Date()) }
+  }
+  func keepForever(_ e: AutopilotEntry) {
+    sendAutopilot(.keep(itemID: e.id)) { AutopilotLocal.keep(&$0, entry: e) }
+  }
+  func restore(_ r: AutopilotReceipt) {
+    sendAutopilot(.restore(receiptID: r.id)) { AutopilotLocal.restore(&$0, receipt: r, now: Date()) }
+  }
+  func forgetRule(_ r: AutopilotRule) {
+    sendAutopilot(.forgetRule(ruleID: r.id)) { AutopilotLocal.forget(&$0, rule: r) }
+  }
+  func setStarter(_ id: String, enabled: Bool) {
+    sendAutopilot(.setStarter(ruleID: id, enabled: enabled)) {
+      AutopilotLocal.setStarter(&$0, id: id, enabled: enabled)
+    }
+  }
+  func setAutopilot(enabled: Bool) {
+    sendAutopilot(.setEnabled(enabled)) { $0.sweep.enabled = enabled }
+  }
+  func setSweepInterval(minutes: Int) {
+    sendAutopilot(.setInterval(minutes: minutes)) { $0.sweep.intervalMinutes = minutes }
+  }
+  func resetTraining() {
+    sendAutopilot(.resetTraining) { AutopilotLocal.reset(&$0) }
+  }
+  func sweepNow() {
+    sendAutopilot(.sweepNow) { AutopilotLocal.sweepNow(&$0, now: Date()) }
+  }
+  private func sendAutopilot(_ command: AutopilotCommand, local: (inout AutopilotSnapshot) -> Void) {
+    if let runner = autopilotRunner {
+      Task { [weak self] in
+        if let next = await runner(command) {
+          self?.autopilot = next
+        } else {
+          if self?.message == nil {
+            self?.message = "Autopilot couldn't finish that. Try again in a moment."
+          }
+        }
+      }
+      return
+    }
+    guard demo else {
+      message = "Autopilot isn't connected yet."
+      return
+    }
+    var next = autopilot
+    local(&next)
+    autopilot = next
   }
   func quit() {
     Task {
@@ -567,9 +844,18 @@ private func status(_ d: Disposition) -> String {
 }
 
 struct Dashboard: View {
-  @StateObject private var reviewerSettings = ReviewSettingsModel()
-  @StateObject private var huntSettings = HuntSettingsModel()
+  @StateObject private var reviewerSettings: ReviewSettingsModel
+  @StateObject private var huntSettings: HuntSettingsModel
   @ObservedObject var model: AppModel
+  /// Proofs pass scratch-folder models so rendering never reads the real state folder.
+  init(
+    model: AppModel, reviewerSettings: ReviewSettingsModel? = nil,
+    huntSettings: HuntSettingsModel? = nil
+  ) {
+    self.model = model
+    _reviewerSettings = StateObject(wrappedValue: reviewerSettings ?? ReviewSettingsModel())
+    _huntSettings = StateObject(wrappedValue: huntSettings ?? HuntSettingsModel())
+  }
   var eligible: Int { model.state.findings.filter { $0.disposition == .eligible }.count }
   var attention: Int {
     model.state.findings.filter { $0.disposition == .eligible || $0.disposition == .investigate }
@@ -594,6 +880,10 @@ struct Dashboard: View {
           "Refresh observations")
       }.padding(20)
       Divider()
+      if model.autopilotAvailable && model.selection == nil {
+        AutopilotMenuSection(model: model)
+        Divider()
+      }
       if let error = model.state.error {
         Label(error, systemImage: "exclamationmark.shield").font(.callout).padding()
           .foregroundStyle(.red)
@@ -812,22 +1102,27 @@ struct Dashboard: View {
   var settings: some View {
     Group {
       FullDiskAccessView(model: model)
-      Text("Quiet by default.").font(.title2.weight(.semibold))
-      Text("Your whole Mac. One observer.").font(.headline)
-      Text(
-        "BurnZombies watches processes across all projects and sessions. Your selected harness reviews buildup in the background, even with no active chat. Active and uncertain work stays running."
-      )
-      .font(.caption).foregroundStyle(.secondary)
-      Text(
-        model.accessReady
-          ? model.machineReview.detail
-          : "Background reviews wait until Full Disk Access is available."
-      ).font(.caption).foregroundStyle(.secondary)
-      if model.accessReady && model.machineReview.phase == "paused" {
-        Button("Resume scheduled hunts") { model.setAutomatic(true) }.clickPointer()
+      if model.autopilotAvailable {
+        AutopilotSettingsView(model: model)
+      } else {
+        Text("Quiet by default.").font(.title2.weight(.semibold))
+        Text("Your whole Mac. One observer.").font(.headline)
+        Text(
+          "BurnZombies watches processes across all projects and sessions. Your selected harness reviews buildup in the background, even with no active chat. Active and uncertain work stays running."
+        )
+        .font(.caption).foregroundStyle(.secondary)
+        Text(
+          model.accessReady
+            ? model.machineReview.detail
+            : "Background reviews wait until Full Disk Access is available."
+        ).font(.caption).foregroundStyle(.secondary)
+        if model.accessReady && model.machineReview.phase == "paused" {
+          Button("Resume scheduled hunts") { model.setAutomatic(true) }.clickPointer()
+        }
+        // Autopilot replaces the evidence-led hunt schedule when it is available.
+        HuntSettingsView(settings: huntSettings, onSaved: model.reloadReviewConfiguration)
+          .disabled(model.demo)
       }
-      HuntSettingsView(settings: huntSettings, onSaved: model.reloadReviewConfiguration).disabled(
-        model.demo)
       ReviewSettingsView(settings: reviewerSettings).disabled(model.demo)
       UsageHistoryView().disabled(model.demo)
       DiskSettingsView(accessReady: model.accessReady).disabled(model.demo)
@@ -888,6 +1183,10 @@ struct Dashboard: View {
   var auditWindow: NSWindow?
   var menuPreviewWindow: NSWindow?
   var huntWindow: NSWindow?
+  var findingsWindow: NSWindow?
+  var autopilotFindingsWindow: NSWindow?
+  var teachWindow: NSWindow?
+  var findingNotifications: FindingNotifications?
   var model: AppModel!
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -902,6 +1201,13 @@ struct Dashboard: View {
       self?.showAudit()
     }
     model.openWorktrees = { [weak self] in self?.showWorktrees() }
+    model.openWorktreeID = { [weak self] id in self?.showWorktrees(selectedID: id) }
+    model.openFindings = { [weak self] in self?.showFindings() }
+    model.openAdvancedFindings = { [weak self] in self?.showAdvancedFindings() }
+    model.openTeach = { [weak self] in self?.showTeach() }
+    findingNotifications = FindingNotifications { [weak self] id, revision, action in
+      self?.model.notificationAction(id: id, revision: revision, action: action)
+    }
     model.openAudit = { [weak self] in self?.showAudit() }
     model.openHunt = { [weak self] in self?.showHunt() }
     item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -922,6 +1228,9 @@ struct Dashboard: View {
     NSWorkspace.shared.notificationCenter.addObserver(
       self, selector: #selector(waking), name: NSWorkspace.didWakeNotification, object: nil)
     if CommandLine.arguments.contains("--show-worktrees") { showWorktrees() }
+    if CommandLine.arguments.contains("--show-findings") { showFindings() }
+    if CommandLine.arguments.contains("--show-advanced-findings") { showAdvancedFindings() }
+    if CommandLine.arguments.contains("--show-teach") { showTeach() }
     if CommandLine.arguments.contains("--show-window") { showImpact("Impact") }
     if CommandLine.arguments.contains("--show-popover") { toggle() }
     if CommandLine.arguments.contains("--show-mini-window") {
@@ -966,20 +1275,45 @@ struct Dashboard: View {
     window?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
-  func showWorktrees() {
+  func showWorktrees(selectedID: String? = nil) {
     popover?.performClose(nil)
     if worktreeWindow == nil {
-      let w = NSWindow(
-        contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
-        styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered,
-        defer: false)
-      w.title = "BurnZombies — Worktrees"
-      w.isReleasedWhenClosed = false
-      w.contentView = NSHostingView(rootView: WorktreesView(model: model))
-      w.center()
-      worktreeWindow = w
+      worktreeWindow = WorktreesView.makeWindow(model: model, selectedID: selectedID)
+    }
+    if let selectedID {
+      worktreeWindow?.contentView = WorktreesView.hostingView(model: model, selectedID: selectedID)
     }
     worktreeWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+  /// The simple Findings window. Until an Autopilot engine is attached there is nothing for it
+  /// to show, so the detailed window opens instead and the menu keeps working as before.
+  func showFindings() {
+    guard model.autopilotAvailable else {
+      showAdvancedFindings()
+      return
+    }
+    popover?.performClose(nil)
+    if autopilotFindingsWindow == nil {
+      autopilotFindingsWindow = AutopilotFindingsView.makeWindow(model: model)
+    }
+    autopilotFindingsWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+  func showAdvancedFindings() {
+    popover?.performClose(nil)
+    if findingsWindow == nil {
+      findingsWindow = FindingsView.makeWindow(model: model)
+    }
+    findingsWindow?.makeKeyAndOrderFront(nil)
+    NSApp.activate(ignoringOtherApps: true)
+  }
+  func showTeach() {
+    popover?.performClose(nil)
+    if teachWindow == nil {
+      teachWindow = TeachView.makeWindow(model: model)
+    }
+    teachWindow?.makeKeyAndOrderFront(nil)
     NSApp.activate(ignoringOtherApps: true)
   }
   func showAudit() {
@@ -1068,9 +1402,200 @@ struct Dashboard: View {
   }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
+#if DEBUG
+  extension AppModel {
+    /// Exercise the real snapshot callback and Foundation timer without an observer or window.
+    func proveObservationSchedule() async throws {
+      guard demo else { throw StoreError.message("Scheduling proof requires a demo model") }
+      defer { timer?.invalidate() }
+      var dispatches = 0
+      timerDispatchForProof = { dispatches += 1 }
+      state.interval = 0.5
+      schedule()
+      guard let original = timer else { throw StoreError.message("Observer timer missing") }
+      for _ in 0..<5 {
+        receiveAgentSnapshot(state)
+        guard timer === original, original.isValid else {
+          throw StoreError.message("Read-only status snapshots postponed the observer timer")
+        }
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      try await Task.sleep(for: .milliseconds(600))
+      guard !original.isValid, dispatches == 1 else {
+        throw StoreError.message("Observer timer never dispatched after status traffic")
+      }
+      state.interval = 60
+      receiveAgentSnapshot(state)
+      guard let long = timer, long.isValid, long !== original else {
+        throw StoreError.message("A fired timer was not replaced")
+      }
+      let longDeadline = long.fireDate
+      state.interval = 15
+      receiveAgentSnapshot(state)
+      guard let urgent = timer, urgent !== long, urgent.fireDate < longDeadline else {
+        throw StoreError.message("Exit verification did not shorten the observer deadline")
+      }
+      state.interval = 60
+      receiveAgentSnapshot(state)
+      guard timer === urgent, urgent.tolerance <= 2.5 else {
+        throw StoreError.message("A later snapshot postponed an earlier observer deadline")
+      }
+      suspend()
+      guard !urgent.isValid else {
+        throw StoreError.message("Suspend left the observer timer active")
+      }
+      receiveAgentSnapshot(state)
+      guard timer?.isValid != true else {
+        throw StoreError.message("A late snapshot revived suspended observation")
+      }
+      wake()
+      state.interval = 0.05
+      working = true
+      receiveAgentSnapshot(state)
+      try await Task.sleep(for: .milliseconds(150))
+      guard dispatches == 2, timer?.isValid == false else {
+        throw StoreError.message("Busy observation did not consume its one-shot timer")
+      }
+      working = false
+      receiveAgentSnapshot(state)
+      guard timer?.isValid == true else {
+        throw StoreError.message("Completed snapshot did not rearm observation")
+      }
+      await shutdownWorktrees()
+      receiveAgentSnapshot(state)
+      wake()
+      receiveAgentSnapshot(state)
+      guard timer?.isValid != true else {
+        throw StoreError.message("Shutdown observation was revived")
+      }
+      applyNotificationAuthorization(false)
+      guard message == notificationPermissionError, !state.catalog.preferences.notifications else {
+        throw StoreError.message("Notification refusal was not shown")
+      }
+      applyNotificationAuthorization(true)
+      guard message == nil, state.catalog.preferences.notifications else {
+        throw StoreError.message("Successful permission kept its previous refusal")
+      }
+      applyNotificationAuthorization(false)
+      message = "Unrelated recovery failure"
+      applyNotificationAuthorization(true)
+      guard message == "Unrelated recovery failure" else {
+        throw StoreError.message("Permission success hid an unrelated failure")
+      }
+      let proposal = CleanupProposal(
+        action: .worktree, resources: ["synthetic"], revision: "proof", title: "Synthetic finding",
+        detail: "Offscreen notification lifecycle proof", recovery: "No files changed", ready: true)
+      let overlapping = AppModel(demo: true)
+      var notificationSends = 0
+      try await overlapping.deliverFindingNotification(
+        next: { proposal },
+        send: { _ in
+          notificationSends += 1
+          try await overlapping.deliverFindingNotification(
+            next: { proposal }, send: { _ in notificationSends += 1 }, record: { _ in })
+        }, record: { _ in })
+      guard notificationSends == 1 else {
+        throw StoreError.message("Overlapping observation delivered the same notification twice")
+      }
+      do {
+        try await overlapping.deliverFindingNotification(
+          next: { proposal }, send: { _ in throw StoreError.message("Synthetic send failure") },
+          record: { _ in })
+      } catch {}
+      try await overlapping.deliverFindingNotification(
+        next: { proposal }, send: { _ in notificationSends += 1 }, record: { _ in })
+      guard notificationSends == 2 else {
+        throw StoreError.message("Failed notification delivery blocked later notifications")
+      }
+      for stopping in [false, true] {
+        let beforeDelivery = AppModel(demo: true)
+        var sent = 0
+        var recorded = 0
+        try await beforeDelivery.deliverFindingNotification(
+          next: {
+            if stopping {
+              await beforeDelivery.shutdownWorktrees()
+            } else {
+              beforeDelivery.suspend()
+            }
+            return proposal
+          }, send: { _ in sent += 1 }, record: { _ in recorded += 1 })
+        guard sent == 0, recorded == 0 else {
+          throw StoreError.message("Inactive observer delivered a late notification candidate")
+        }
+        let duringDelivery = AppModel(demo: true)
+        try await duringDelivery.deliverFindingNotification(
+          next: { proposal },
+          send: { _ in
+            sent += 1
+            if stopping {
+              await duringDelivery.shutdownWorktrees()
+            } else {
+              duringDelivery.suspend()
+            }
+          }, record: { _ in recorded += 1 })
+        duringDelivery.receiveAgentSnapshot(duringDelivery.state)
+        guard sent == 1, recorded == 1, duringDelivery.timer?.isValid != true else {
+          throw StoreError.message(
+            "Successful delivery lost its receipt or revived inactive observation")
+        }
+      }
+      print(
+        "PASS native timer dispatch under status traffic, urgent cadence, busy rearming, suspend/shutdown across notification awaits, and scoped permission messages"
+      )
+    }
+  }
+#endif
 MainActor.assumeIsolated {
   let app = NSApplication.shared
   #if DEBUG
+    if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--observer-schedule-proof" {
+      app.setActivationPolicy(.prohibited)
+      Task { @MainActor in
+        do {
+          try await AppModel(demo: true).proveObservationSchedule()
+          exit(0)
+        } catch {
+          print("FAIL \(error.localizedDescription)")
+          exit(1)
+        }
+      }
+      app.run()
+      exit(1)
+    }
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--findings-proof" {
+      do {
+        try findingsProof(output: CommandLine.arguments[2])
+        exit(0)
+      } catch {
+        print("FAIL \(error.localizedDescription)")
+        exit(1)
+      }
+    }
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--autopilot-proof" {
+      do {
+        try autopilotProof(output: CommandLine.arguments[2])
+        exit(0)
+      } catch {
+        print("FAIL \(error.localizedDescription)")
+        exit(1)
+      }
+    }
+    if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--worktree-inventory-proof"
+    {
+      app.setActivationPolicy(.prohibited)
+      Task { @MainActor in
+        do {
+          try await worktreeInventoryProof()
+          exit(0)
+        } catch {
+          print("FAIL \(error.localizedDescription)")
+          exit(1)
+        }
+      }
+      app.run()
+      exit(1)
+    }
     if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--worktree-view-proof" {
       do {
         try worktreeViewProof(output: CommandLine.arguments[2])

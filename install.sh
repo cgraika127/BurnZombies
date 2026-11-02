@@ -2,14 +2,16 @@
 set -euo pipefail
 
 # Public installer: no sudo, package manager, compiler, or shell-profile changes.
-version="0.12.2"
+version="0.13.0"
 client="auto"
 launch=true
+setup_options=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mcp) client="${2:?Choose auto, all, codex, claude, cursor, copilot, gemini or none}"; shift 2 ;;
     --no-open) launch=false; shift ;;
-    --help) echo 'Install BurnZombies: install.sh [--mcp auto|all|codex|claude|cursor|copilot|gemini|none] [--no-open]'; exit 0 ;;
+    --observe-only) setup_options+=(--observe-only); shift ;;
+    --help) echo 'Install BurnZombies: install.sh [--mcp auto|codex|claude|none] [--observe-only] [--no-open]'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -19,7 +21,33 @@ os_major="$(sw_vers -productVersion | cut -d. -f1)"
 [[ "$os_major" -ge 14 ]] || { echo 'BurnZombies needs macOS 14 or later.' >&2; exit 1; }
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/burnzombies-install.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+replacing=false
+finish_install() {
+  status=$?
+  if [[ "$status" -ne 0 ]]; then
+    if [[ "$replacing" == true && -x "$app/Contents/MacOS/burnzombies" ]]; then
+      if ! "$app/Contents/MacOS/burnzombies" stop-observer "$app"; then
+        echo "Rollback paused: the observer is still closing. Preserve $app and $work/previous.app" >&2
+        return
+      fi
+    fi
+    if [[ "$replacing" == true ]]; then rm -rf "$app"; fi
+    if [[ -d "$work/previous.app" ]]; then
+      if [[ -e "$app" || -L "$app" ]]; then
+        echo "Rollback preserved both locations without merging: $app and $work/previous.app" >&2
+        return
+      fi
+      if ! mv "$work/previous.app" "$app"; then
+        echo "Rollback could not finish. Previous app preserved at $work/previous.app" >&2
+        return
+      fi
+      if $launch; then "$app/Contents/MacOS/burnzombies" start-observer || true; fi
+      echo 'Previous app restored.' >&2
+    fi
+  fi
+  rm -rf "$work"
+}
+trap finish_install EXIT
 asset="BurnZombies-macOS-universal.tar.gz"
 base="https://github.com/swordfish444/BurnZombies/releases/download/v$version"
 echo 'Downloading BurnZombies…'
@@ -51,21 +79,22 @@ if [[ -e "$app" || -L "$app" ]]; then
   [[ "$existing" == io.burnzombies.app ]] || { echo 'An unrelated app already occupies the install path.' >&2; exit 1; }
   # Finish the old observer before moving its running executable or database owner.
   "$work/BurnZombies.app/Contents/MacOS/burnzombies" stop-observer "$app"
-  mv "$app" "$work/previous.app"
+  if ! mv "$app" "$work/previous.app"; then
+    if $launch; then "$app/Contents/MacOS/burnzombies" start-observer || true; fi
+    echo 'Previous app could not be moved; update cancelled.' >&2
+    exit 1
+  fi
 fi
+replacing=true
 if ! ditto "$work/BurnZombies.app" "$app"; then
-  rm -rf "$app"
-  [[ ! -d "$work/previous.app" ]] || mv "$work/previous.app" "$app"
-  echo 'Install failed; previous app restored.' >&2; exit 1
+  echo 'Install failed; rolling back.' >&2; exit 1
 fi
 
 if [[ "$client" != none ]]; then
   if ! "$app/Contents/MacOS/burnzombies" retire-skill --check ||
-     ! "$app/Contents/MacOS/burnzombies" setup --harness "$client" ||
+     ! "$app/Contents/MacOS/burnzombies" setup --harness "$client" ${setup_options[@]+"${setup_options[@]}"} ||
      ! "$app/Contents/MacOS/burnzombies" retire-skill; then
-    rm -rf "$app"
-    [[ ! -d "$work/previous.app" ]] || mv "$work/previous.app" "$app"
-    echo 'Harness configuration failed; previous app restored. Configurations were preserved.' >&2
+    echo 'Harness configuration failed; rolling back. Configurations were preserved.' >&2
     exit 1
   fi
 fi

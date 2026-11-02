@@ -19,12 +19,14 @@ public struct AgentRequest: Codable, Sendable {
   public let reviewIDs: [String]?
   public let recordIDs: [String]?
   public let worktreeRequest: WorktreeRequest?
+  /// JSON body for operations with their own schema, such as `autopilot`.
+  public let payload: String?
   // Populated from the authenticated Unix peer, never from request JSON.
   public var callerPID: Int32 = -1
   enum CodingKeys: String, CodingKey {
     case operation, findingID, previewToken, processIDs, pids, offset, label, rationale, action,
       workToken, completionCondition, workspacePath, workspaceID, reviewIDs, recordIDs,
-      worktreeRequest
+      worktreeRequest, payload
   }
   public init(
     _ operation: String, findingID: String? = nil, previewToken: String? = nil,
@@ -32,8 +34,10 @@ public struct AgentRequest: Codable, Sendable {
     label: String? = nil, rationale: String? = nil, action: String? = nil,
     reviewIDs: [String]? = nil,
     workToken: String? = nil, completionCondition: String? = nil, workspacePath: String? = nil,
-    workspaceID: String? = nil, recordIDs: [String]? = nil, worktreeRequest: WorktreeRequest? = nil
+    workspaceID: String? = nil, recordIDs: [String]? = nil, worktreeRequest: WorktreeRequest? = nil,
+    payload: String? = nil
   ) {
+    self.payload = payload
     self.operation = operation
     self.findingID = findingID
     self.previewToken = previewToken
@@ -78,6 +82,8 @@ public struct AgentGroup: Codable, Sendable {
 }
 
 public struct AgentReply: Codable, Sendable {
+  public var appVersion: String? = BuildIdentity.version
+  public var appBuild: String? = BuildIdentity.build
   public var ok: Bool
   public var message: String
   public var findings: [AgentFinding] = []
@@ -115,7 +121,11 @@ public struct AgentReply: Codable, Sendable {
   public var worktreeReceipts: [WorkspaceReceipt] = []
   public var worktreesCleaned: Int = 0
   public var worktreeInventory: WorktreeReply?
+  public var inbox: FindingsSnapshot?
+  public var passiveCoverage: String?
+  public var decisionContext: [String]?
   public var diskReclaimedBytes: UInt64 = 0
+  public var payload: String?
   public init(ok: Bool = true, message: String) {
     self.ok = ok
     self.message = message
@@ -160,11 +170,25 @@ public actor AgentService {
   private var diskPreviews: [String: (DiskCandidate, String, Date, ProcessIdentity)] = [:]
   private var workspacePreviews: [String: WorkspacePreview] = [:]
   private var previews: [String: Preview] = [:]
-  public init(monitor: Monitor) { self.monitor = monitor }
+  private let autopilot: Autopilot?
+  public init(monitor: Monitor, autopilot: Autopilot? = nil) {
+    self.monitor = monitor
+    self.autopilot = autopilot
+  }
   public func call(_ request: AgentRequest) async -> AgentReply {
+    if request.operation == "autopilot" {
+      guard let autopilot, let body = request.payload,
+        let input = try? JSONDecoder().decode(AutopilotRequest.self, from: Data(body.utf8))
+      else { return AgentReply(ok: false, message: "Autopilot is unavailable or the request is malformed.") }
+      let (ok, json) = await autopilot.handle(input)
+      var reply = AgentReply(ok: ok, message: ok ? "ok" : json)
+      reply.payload = json
+      return reply
+    }
     guard
       [
-        "status", "access_status", "access_check", "inspect", "preview", "burn", "lifecycle",
+        "status", "findings", "access_status", "access_check", "inspect", "preview", "burn",
+        "lifecycle",
         "work", "workspace",
         "workspace_preview", "workspace_clean", "worktrees", "worktrees_read", "disk_decide",
         "disk_preview", "disk_clean", "disk_inspect", "disk_explore", "disk_recommend",
@@ -195,6 +219,27 @@ public actor AgentService {
       return reply
     }
     var state = await monitor.snapshot()
+    if request.operation == "findings" {
+      var reply = AgentReply(
+        message:
+          "Native findings, explicit decisions and operation status. Read-only; no cleanup authority is granted."
+      )
+      let offset = max(0, request.offset ?? 0)
+      var inbox: FindingsSnapshot
+      do { inbox = try await monitor.findingPage(offset: offset) } catch {
+        return AgentReply(
+          ok: false, message: "Finding evidence unavailable: " + error.localizedDescription)
+      }
+      let total = inbox.totalProposals
+      inbox.proposals = Array(inbox.proposals.prefix(50))
+      let ids = Set(inbox.proposals.map(\.id))
+      inbox.decisions = Array(inbox.decisions.filter { ids.contains($0.proposal) }.suffix(50))
+      inbox.operations = Array(inbox.operations.filter { ids.contains($0.proposal) }.suffix(50))
+      reply.inbox = inbox
+      reply.passiveCoverage = state.passiveCoverage
+      if offset + 50 < total { reply.nextOffset = offset + 50 }
+      return reply
+    }
     if request.operation != "status" {
       do { try await monitor.requireFullDiskAccess() } catch {
         var reply = AgentReply(ok: false, message: error.localizedDescription)
@@ -441,12 +486,39 @@ public actor AgentService {
       )
       reply.failureKind = "recommendation_rejected"
       return reply
-    } catch { return AgentReply(ok: false, message: error.localizedDescription) }
+    } catch {
+      if error.localizedDescription.hasPrefix("Approval required.") {
+        var reply = AgentReply(message: error.localizedDescription)
+        reply.failureKind = "approval_required"
+        return reply
+      }
+      return AgentReply(ok: false, message: error.localizedDescription)
+    }
     reply.fullDiskAccess = state.fullDiskAccess
     reply.worktreesCleaned = state.catalog.lifetimeWorktreesCleaned ?? 0
     reply.diskReclaimedBytes = state.catalog.lifetimeDiskReclaimedBytes ?? 0
     reply.worktreeReceipts = Array((state.catalog.workspaceReceipts ?? []).suffix(8))
     if request.operation == "status" && state.fullDiskAccess.canScan {
+      reply.passiveCoverage = state.passiveCoverage
+      if state.catalog.preferences.shareDecisionHistory != false {
+        let selected = state.inbox.proposals.filter { p in
+          request.reviewIDs.map { ids in
+            p.resources.contains { key in
+              ids.contains(key) || ids.contains("owner-process:" + key)
+                || ids.contains("passive:" + key)
+            }
+          } ?? false
+        }
+        let workflows = Set(selected.compactMap(\.workflow))
+        reply.decisionContext = Array(
+          state.inbox.decisions.filter {
+            !$0.fixture && ($0.workflow.map { workflows.contains($0) } ?? false)
+          }
+          .suffix(12)
+        ).map {
+          "Explicit past decision: \($0.decision). Reason (untrusted): \(PassiveSession.excerpt($0.reason)). Historical preference is not current safety or authority."
+        }
+      }
       reply.ownerProcesses = (state.catalog.ownerDaemons ?? []).filter { evidence in
         evidence.eligible && (request.reviewIDs == nil || request.reviewIDs!.contains(evidence.id))
       }.map(OwnerProcessSummary.init)
@@ -610,8 +682,18 @@ public final class AgentListener: @unchecked Sendable {
   public static func socketPath(_ root: URL = Store.defaultRoot) -> String {
     root.appendingPathComponent("agent.sock").path
   }
-  public init(
+  public convenience init(
     root: URL = Store.defaultRoot,
+    handler: @escaping @Sendable (AgentRequest) async -> AgentReply
+  ) throws {
+    try self.init(
+      root: root, responseWriter: { await Self.writeResponse($0, $1) }, handler: handler)
+  }
+  // Package-scoped seam lets the socket proof hold finalization after an actual
+  // successful write. Public callers always use the native writer.
+  package init(
+    root: URL,
+    responseWriter: @escaping @Sendable (Int32, String) async -> Int32,
     handler: @escaping @Sendable (AgentRequest) async -> AgentReply
   ) throws {
     let store = try Store(root: root)
@@ -688,9 +770,12 @@ public final class AgentListener: @unchecked Sendable {
           var receipt = AgentTransportReceipt(
             started: Date(), operation: "unknown", status: "read_failed",
             frameMilliseconds: 0, handlerMilliseconds: 0, totalMilliseconds: 0, responseBytes: 0)
+          var responseWriteCompleted = false
           defer {
             receipt.totalMilliseconds = (bz_continuous_ns() - began) / 1_000_000
-            if Task.isCancelled { receipt.status = "cancelled" }
+            // Shutdown may cancel the task after its complete response reached
+            // the client but before the native write continuation resumed.
+            if Task.isCancelled && !responseWriteCompleted { receipt.status = "cancelled" }
             clients.record(receipt)
           }
           let data: Data? = await withCheckedContinuation { continuation in
@@ -710,6 +795,7 @@ public final class AgentListener: @unchecked Sendable {
             // The operation field is untrusted too. Persist only known wire operation names.
             let known = [
               "status", "access_status", "access_check", "inspect", "preview", "burn", "lifecycle",
+              "findings",
               "work", "workspace",
               "workspace_preview", "workspace_clean", "worktrees", "worktrees_read", "disk_decide",
               "disk_preview", "disk_clean",
@@ -736,20 +822,22 @@ public final class AgentListener: @unchecked Sendable {
               receipt.status = "oversize"
               return
             }
-            let written: Int32 = await withCheckedContinuation { continuation in
-              DispatchQueue.global(qos: .utility).async {
-                continuation.resume(
-                  returning: line.withCString {
-                    bz_agent_write(client, $0, Int32(line.utf8.count))
-                  })
-              }
-            }
+            let written = await responseWriter(client, line)
+            responseWriteCompleted = written == 0
             if written != 0 {
               receipt.status = "write_failed"
             }
           } catch { receipt.status = "encoding_failed" }
         }
         clients.attach(work, to: client)
+      }
+    }
+  }
+  package static func writeResponse(_ client: Int32, _ line: String) async -> Int32 {
+    await withCheckedContinuation { continuation in
+      DispatchQueue.global(qos: .utility).async {
+        continuation.resume(
+          returning: line.withCString { bz_agent_write(client, $0, Int32(line.utf8.count)) })
       }
     }
   }
@@ -812,8 +900,9 @@ public enum AgentConnection {
     // Legacy preview performs two complete native consumer passes. Its read-only
     // budget must not inherit the fast status deadline or outlast preservation.
     let workspacePreview = request.operation == "workspace_preview"
+    // Autopilot burns can retire several old copies in one call.
     let deadline =
-      worktree
+      worktree || request.operation == "autopilot"
       ? 900000 : workspacePreview ? 30000 : request.operation == "disk_inspect" ? 15000 : 5000
     let count = bz_agent_read_timeout(fd, &buffer, Int32(buffer.count), Int32(deadline))
     guard count > 0 else {

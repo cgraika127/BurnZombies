@@ -12,18 +12,31 @@ final class WorktreeScanControl: @unchecked Sendable {
 private final class WorktreePathBox {
   var paths = Set<String>()
   var invalid = false
+  let roots: [String]
+  init(roots: [String]) { self.roots = roots }
 }
 public struct WorktreeConsumerSnapshot: Sendable {
   public let paths: Set<String>
   public let gap: String?
-  public init() {
-    let box = WorktreePathBox()
+  private let roots: [String]
+  public init(roots: [String] = []) {
+    let box = WorktreePathBox(roots: roots.map(WorkspaceSafety.canonical))
+    self.roots = box.roots
     var detail = [CChar](repeating: 0, count: 256)
     let status = bz_worktree_paths(
       { context, path in
         guard let context, let path else { return }
         let b = Unmanaged<WorktreePathBox>.fromOpaque(context).takeUnretainedValue()
-        guard let value = String(validatingUTF8: path), b.paths.count < 100_000 else {
+        guard let value = String(validatingUTF8: path), value.isEmpty || value.hasPrefix("/") else {
+          b.invalid = true
+          return
+        }
+        // Kernel vnode paths are physical file-backed paths. Project the
+        // requested roots before retaining metadata from unrelated large VMs.
+        if !b.roots.isEmpty && !b.roots.contains(where: { WorkspaceSafety.contains($0, value) }) {
+          return
+        }
+        guard b.paths.contains(value) || b.paths.count < 500_000 else {
           b.invalid = true
           return
         }
@@ -37,6 +50,9 @@ public struct WorktreeConsumerSnapshot: Sendable {
         ? "Path snapshot exceeded its bounds or encoding support." : String(cString: detail))
   }
   public func state(_ path: String) -> Int32 {
+    if !roots.isEmpty && !roots.contains(where: { WorkspaceSafety.contains($0, path) }) {
+      return -1
+    }
     if paths.contains(where: { WorkspaceSafety.contains(path, $0) }) { return 1 }
     return gap == nil ? 0 : -1
   }
@@ -48,6 +64,9 @@ struct WorktreeScanEnvelope: Codable {
   var gap: String?
   var complete = false
   var cursor: Int?
+  var unavailablePath: String?
+  var inspecting: String?
+  var deferred: Bool?
 }
 
 public enum WorktreeScanWorker {
@@ -62,22 +81,69 @@ public enum WorktreeScanWorker {
     else { return 64 }
     func emit(
       _ record: WorktreeRecord? = nil, gap: String? = nil, complete: Bool = false,
-      cursor: Int? = nil
+      cursor: Int? = nil, unavailablePath: String? = nil, inspecting: String? = nil,
+      deferred: Bool? = nil
     ) {
       if let data = try? WorktreeEncoding.data(
-        WorktreeScanEnvelope(run: run, record: record, gap: gap, complete: complete, cursor: cursor)
+        WorktreeScanEnvelope(
+          run: run, record: record, gap: gap, complete: complete, cursor: cursor,
+          unavailablePath: unavailablePath, inspecting: inspecting, deferred: deferred)
       ) {
         try? FileHandle.standardOutput.write(contentsOf: data + Data([10]))
       }
     }
     emit()
-    let consumers = WorktreeConsumerSnapshot()
+    let started = ProcessInfo.processInfo.systemUptime
+    let knownOnly = ProcessInfo.processInfo.environment["BURNZOMBIES_WORKTREE_REFRESH"] == "1"
+    let roots = Array(arguments.dropFirst(2))
+    if knownOnly {
+      do {
+        let store = try Store()
+        let input = store.root.appendingPathComponent("worktree-refresh-" + run + ".json")
+        let rows = try JSONDecoder().decode(
+          [WorktreeRecord].self, from: store.read(input, limit: 2_097_152))
+        guard !rows.isEmpty, rows.count <= 8, Set(rows.map(\.id)).count == rows.count,
+          rows.map(\.path) == roots, rows.allSatisfy({ !$0.id.isEmpty && $0.id.utf8.count < 4096 })
+        else { return 64 }
+        // Inspect recorded identities directly. Rediscovery by path can report a
+        // replacement repository instead and leave the original row stale forever.
+        var consumers: WorktreeConsumerSnapshot?
+        for row in rows {
+          // Reserve a useful inspection slice. Exhausting the batch is normal
+          // bounded progress, not a loss of the observations already completed.
+          guard ProcessInfo.processInfo.systemUptime - started < 9 else {
+            emit(complete: true, deferred: true)
+            return 0
+          }
+          emit(inspecting: row.id)
+          emit(
+            WorktreeInspection.inspect(
+              row,
+              visibility: { path in
+                if consumers == nil {
+                  consumers = WorktreeConsumerSnapshot(roots: roots)
+                  if let gap = consumers?.gap { emit(gap: "Consumer coverage: " + gap) }
+                }
+                return consumers?.state(path) ?? -1
+              }))
+        }
+        emit(complete: true, cursor: 0)
+        return 0
+      } catch {
+        emit(gap: "Known worktree request unavailable: " + error.localizedDescription)
+        return 65
+      }
+    }
+    let consumers = WorktreeConsumerSnapshot(roots: roots)
     if let gap = consumers.gap { emit(gap: "Consumer coverage: " + gap) }
     let result = WorktreeDiscovery.scan(
-      roots: Array(arguments.dropFirst(2)), seconds: 240,
+      roots: roots,
+      seconds: 240,
       visibility: { consumers.state($0) }, inspectOffset: cursor, publish: { emit($0) },
-      progress: { emit() })
-    for gap in result.gaps { emit(gap: gap) }
+      progress: { emit() },
+      checkpoint: Store.defaultRoot.appendingPathComponent("worktree-discovery-cursor.json"))
+    for (path, gap) in result.unavailablePaths { emit(gap: gap, unavailablePath: path) }
+    for gap in result.gaps where !result.unavailablePaths.values.contains(gap) { emit(gap: gap) }
     emit(complete: true, cursor: result.nextInspection)
     return 0
   }
@@ -93,6 +159,7 @@ private final class WorktreeScanCapture {
   var progress = ProcessInfo.processInfo.systemUptime
   var result = WorktreeDiscoveryResult()
   var complete = false
+  var inspectionUptime: TimeInterval?
   init(
     fd: Int32, run: String, publish: @escaping @Sendable (WorktreeRecord) -> Void,
     keepGoing: @escaping @Sendable () -> Bool
@@ -118,18 +185,36 @@ private final class WorktreeScanCapture {
         guard let item = try? JSONDecoder().decode(WorktreeScanEnvelope.self, from: line),
           item.run == run
         else { return false }
+        if let inspecting = item.inspecting {
+          guard !inspecting.isEmpty, inspecting.utf8.count < 4096 else { return false }
+          result.inspectionInProgress = inspecting
+          result.inspectionStartedAt = Date()
+          inspectionUptime = ProcessInfo.processInfo.systemUptime
+        }
         if let record = item.record {
           guard record.path.hasPrefix("/"), record.path.utf8.count < 4096,
             result.records.count < 20_000
           else { return false }
           result.records.append(record)
           publish(record)
+          if result.inspectionInProgress == record.id {
+            result.inspectionInProgress = nil
+            result.inspectionStartedAt = nil
+            inspectionUptime = nil
+          }
         }
-        if let gap = item.gap { result.gaps.append(String(gap.prefix(1000))) }
+        if let gap = item.gap {
+          let detail = String(gap.prefix(1000))
+          result.gaps.append(detail)
+          if let path = item.unavailablePath, path.hasPrefix("/"), path.utf8.count < 4096 {
+            result.unavailablePaths[path] = detail
+          }
+        }
         if let cursor = item.cursor, (0...100_000).contains(cursor) {
           result.nextInspection = cursor
         }
         complete = item.complete || complete
+        result.deferred = item.deferred == true || result.deferred
       }
     }
     return ProcessInfo.processInfo.systemUptime - progress < 30
@@ -150,6 +235,7 @@ public final class WorktreeScanRunner: @unchecked Sendable {
   }
   public func run(
     roots: [String], root: URL, inspectOffset: Int = 0,
+    knownRecords: [WorktreeRecord]? = nil,
     publish: @escaping @Sendable (WorktreeRecord) -> Void,
     keepGoing: @escaping @Sendable () -> Bool = { true }
   ) -> WorktreeDiscoveryResult {
@@ -163,6 +249,17 @@ public final class WorktreeScanRunner: @unchecked Sendable {
       return .init(gaps: ["Discovery root count exceeds bounded worker support."])
     }
     let run = UUID().uuidString
+    let requestFile = root.appendingPathComponent("worktree-refresh-" + run + ".json")
+    if let rows = knownRecords {
+      guard !rows.isEmpty, rows.count <= 8, rows.map(\.path) == roots else {
+        return .init(gaps: ["Invalid bounded known worktree request."])
+      }
+      do {
+        try Store(root: root).write(
+          WorktreeEncoding.data(rows), to: requestFile, limit: 2_097_152)
+      } catch { return .init(gaps: [error.localizedDescription]) }
+    }
+    defer { if knownRecords != nil { unlink(requestFile.path) } }
     let file = root.appendingPathComponent("worktree-scan-" + run)
     let fd = open(file.path, O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard fd >= 0 else { return .init(gaps: ["Cannot create bounded worktree scan capture."]) }
@@ -176,7 +273,8 @@ public final class WorktreeScanRunner: @unchecked Sendable {
         value.withCString { strdup($0) }
       } + [nil]
     var environment =
-      ["PATH=/usr/bin:/bin", "HOME=" + NSHomeDirectory(), "BURNZOMBIES_HOME=" + root.path].map {
+      (["PATH=/usr/bin:/bin", "HOME=" + NSHomeDirectory(), "BURNZOMBIES_HOME=" + root.path]
+      + (knownRecords != nil ? ["BURNZOMBIES_WORKTREE_REFRESH=1"] : [])).map {
         (value: String) in
         value.withCString { strdup($0) }
       } + [nil]
@@ -204,6 +302,10 @@ public final class WorktreeScanRunner: @unchecked Sendable {
       capture.result.gaps.append(
         "Worktree worker interrupted or incomplete (status \(status)); completed observations retained."
       )
+    }
+    capture.result.workerCompleted = status == 0 && capture.complete
+    if let started = capture.inspectionUptime {
+      capture.result.inspectionElapsed = ProcessInfo.processInfo.systemUptime - started
     }
     return capture.result
   }

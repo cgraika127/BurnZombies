@@ -3,8 +3,36 @@ import BurnCore
 import SwiftUI
 
 struct WorktreesView: View {
+  @MainActor static func hostingView(
+    model: AppModel, initial: WorktreeReply? = nil, initialTab: String = "Worktrees",
+    selectedID: String? = nil
+  ) -> NSHostingView<WorktreesView> {
+    let host = NSHostingView(
+      rootView: WorktreesView(
+        model: model, initial: initial, initialTab: initialTab, selectedID: selectedID))
+    return host
+  }
+  @MainActor static func makeWindow(
+    model: AppModel, initial: WorktreeReply? = nil, initialTab: String = "Worktrees",
+    selectedID: String? = nil
+  ) -> NSWindow {
+    let window = NSWindow(
+      contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
+      styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false
+    )
+    window.title = "BurnZombies — Worktrees"
+    window.isReleasedWhenClosed = false
+    window.contentMinSize = NSSize(width: 860, height: 540)
+    window.contentView = hostingView(
+      model: model, initial: initial, initialTab: initialTab,
+      selectedID: selectedID)
+    window.center()
+    return window
+  }
   @ObservedObject var model: AppModel
-  @State private var inventory = WorktreeReply()
+  @StateObject private var inventoryModel: WorktreeInventory
+  private var inventory: WorktreeReply { inventoryModel.value }
+  private var loading: Bool { inventoryModel.loading }
   @State private var selected = Set<String>()
   @State private var batchReview: WorktreeReply?
   @State private var finish: WorktreeOperation?
@@ -12,7 +40,6 @@ struct WorktreesView: View {
   @State private var tab = "Worktrees"
   @State private var working = false
   @State private var scanning = false
-  @State private var loading = false
   @State private var localDiff: String?
   @State private var message: String?
   @State private var confirmation: WorktreeRecord?
@@ -24,8 +51,10 @@ struct WorktreesView: View {
     selectedID: String? = nil
   ) {
     self.model = model
-    let value = initial ?? (model.demo ? WorktreeExamples.snapshot() : WorktreeReply())
-    _inventory = State(initialValue: value)
+    let value =
+      initial
+      ?? (model.demo ? WorktreeExamples.snapshot() : model.state.worktrees ?? WorktreeReply())
+    _inventoryModel = StateObject(wrappedValue: WorktreeInventory(initial: value))
     _tab = State(initialValue: initialTab)
     _selected = State(initialValue: selectedID.map { Set([$0]) } ?? [])
   }
@@ -48,13 +77,30 @@ struct WorktreesView: View {
         Image(systemName: "point.3.connected.trianglepath.dotted").foregroundStyle(BurnTheme.orange)
         Text("Worktrees").font(.title2.bold())
         Spacer()
-        if working { ProgressView().controlSize(.small) }
+        if working || loading { ProgressView().controlSize(.small) }
         if scanning {
           Button("Cancel scan") { Task { _ = try? await model.worktree(.init("cancel_scan")) } }
         }
         Button("Add folder…", action: addRoot).disabled(working)
         Button("Scan") { run(.init("scan")) }.disabled(working || !model.accessReady)
       }.padding(20)
+      HStack {
+        Text(
+          inventory.totalRecords == nil && !model.demo
+            ? "Loading worktree inventory…"
+            : "\(inventory.totalRecords ?? inventory.records.count) discovered · \(inventory.policy.roots.count) discovery folders"
+        )
+        Spacer()
+        if let scanned = inventory.lastScan {
+          Text("Last scan \(scanned.formatted(date: .abbreviated, time: .shortened))")
+        }
+      }.font(.caption).foregroundStyle(.secondary).padding(.horizontal, 20).padding(.bottom, 8)
+      if inventory.policy.roots.isEmpty && (inventory.totalRecords != nil || model.demo) {
+        Text(
+          "Worktree discovery is not configured. Add a repository or development folder to begin."
+        )
+        .foregroundStyle(.orange).padding(.horizontal, 20).padding(.bottom, 8)
+      }
       Picker("View", selection: $tab) {
         Text("Worktrees").tag("Worktrees")
         Text("Recovery").tag("Recovery")
@@ -96,7 +142,15 @@ struct WorktreesView: View {
             TextField("Search repository, branch or state", text: $search).textFieldStyle(
               .roundedBorder
             ).padding(12)
-            if rows.isEmpty {
+            if (inventory.totalRecords == nil && !model.demo)
+              || (rows.isEmpty && loading)
+            {
+              ProgressView("Loading worktree inventory…")
+            } else if rows.isEmpty && !search.isEmpty {
+              ContentUnavailableView(
+                "No matching worktrees", systemImage: "magnifyingglass",
+                description: Text("Try a different repository, branch, path or state."))
+            } else if rows.isEmpty {
               ContentUnavailableView(
                 "No worktrees discovered", systemImage: "folder.badge.questionmark",
                 description: Text(
@@ -145,8 +199,10 @@ struct WorktreesView: View {
         recovery
       }
       if !selected.isEmpty && tab == "Worktrees" {
-        Button("Review \(selected.count) selected worktree(s)…") { reviewBatch() }.disabled(working)
-          .padding(8)
+        Button("Review \(selected.count) selected worktree(s)…") { reviewBatch() }.disabled(
+          working || loading
+        )
+        .padding(8)
       }
       Divider()
       VStack(alignment: .leading, spacing: 5) {
@@ -161,7 +217,11 @@ struct WorktreesView: View {
       .preferredColorScheme(.dark)
       .task { await load() }
       .onReceive(model.$state) { state in
-        if !working && !model.demo && state.worktrees != nil { Task { await load() } }
+        if !working && !model.demo, let snapshot = state.worktrees,
+          inventoryModel.needsRefresh(snapshot, observedAt: state.catalog.lastSample)
+        {
+          Task { await load() }
+        }
       }
       .alert(
         dirtyAction ? "Archive and retire this checkout?" : "Retire this clean checkout?",
@@ -266,11 +326,13 @@ struct WorktreesView: View {
         }
         GridRow {
           Text("Local changes").foregroundStyle(.secondary)
-          Text("\(row.changes) changed entries · \(row.ignored) ignored entries")
+          Text(
+            row.revision.isEmpty
+              ? "Not measured" : "\(row.changes) changed entries · \(row.ignored) ignored entries")
         }
         GridRow {
           Text("Footprint").foregroundStyle(.secondary)
-          Text(ImpactNumbers.bytes(row.allocated))
+          Text(row.revision.isEmpty ? "Not measured" : ImpactNumbers.bytes(row.allocated))
         }
         GridRow {
           Text("Consumers").foregroundStyle(.secondary)
@@ -488,12 +550,12 @@ struct WorktreesView: View {
       do {
         let result = try await model.worktree(q)
         if thenScan { _ = try await model.worktree(.init("scan")) }
-        await load()
         message = result.detail
       } catch {
-        await load()
         message = error.localizedDescription
       }
+      await inventoryModel.load(stopping: polling) { try await model.worktree($0) }
+      if let error = inventoryModel.error { message = error }
       working = false
       scanning = false
     }
@@ -506,19 +568,23 @@ struct WorktreesView: View {
           .init("confirm", id: row.id, revision: row.revision, evidence: completion))
         let preview = try await model.worktree(
           .init(dirty ? "preview_dirty" : "preview", id: row.id, revision: row.revision))
-        inventory = try await model.worktree(
+        let result = try await model.worktree(
           .init(
             quarantine ? "quarantine" : (dirty ? "retire_dirty" : "retire"), token: preview.token))
         tab = "Recovery"
-        message = inventory.detail
+        message = result.detail
         await load()
       } catch { message = error.localizedDescription }
       working = false
     }
   }
   func reviewBatch() {
+    let chosen: [WorktreeRecord]
+    do { chosen = try inventoryModel.chosen(selected) } catch {
+      message = error.localizedDescription
+      return
+    }
     working = true
-    let chosen = inventory.records.filter { selected.contains($0.id) }
     Task {
       do {
         batchReview = try await model.worktree(
@@ -530,24 +596,8 @@ struct WorktreesView: View {
     }
   }
   func load() async {
-    if model.demo || loading { return }
-    loading = true
-    defer { loading = false }
-    do {
-      inventory = try await model.worktree(.init("list"))
-      while let offset = inventory.nextOffset {
-        let page = try await model.worktree(.init("list", offset: offset))
-        inventory.records += page.records
-        inventory.owners += page.owners
-        inventory.advice += page.advice
-        inventory.delivery += page.delivery
-        inventory.nextOffset = page.nextOffset
-      }
-      while let offset = inventory.nextOperationOffset {
-        let page = try await model.worktree(.init("operations", offset: offset))
-        inventory.operations += page.operations
-        inventory.nextOperationOffset = page.nextOperationOffset
-      }
-    } catch { message = error.localizedDescription }
+    if model.demo { return }
+    await inventoryModel.load { try await model.worktree($0) }
+    if let error = inventoryModel.error { message = error }
   }
 }

@@ -29,6 +29,8 @@ public struct Observation: Codable, Sendable {
   public var metricsValid: Bool
   public var time: Date
   public var monotonic: Double
+  /// Process group. An orphan whose group leader is gone was left behind by a job.
+  public var pgid: Int32?
   public var name: String {
     URL(fileURLWithPath: executable).lastPathComponent.isEmpty
       ? (zombie ? "Exited child" : "Hidden process")
@@ -38,8 +40,9 @@ public struct Observation: Codable, Sendable {
     identity: ProcessIdentity, parent: Int32 = 1, uid: UInt32 = 501,
     executable: String = "/test/helper", rss: UInt64 = 0, cpuNS: UInt64 = 0, readBytes: UInt64 = 0,
     writeBytes: UInt64 = 0, fds: Int = 0, threads: Int = 1, zombie: Bool = false,
-    metricsValid: Bool = true, time: Date = Date(), monotonic: Double = 0
+    metricsValid: Bool = true, time: Date = Date(), monotonic: Double = 0, pgid: Int32? = nil
   ) {
+    self.pgid = pgid
     self.identity = identity
     self.parent = parent
     self.uid = uid
@@ -63,7 +66,10 @@ public struct Record: Codable, Identifiable, Sendable {
   public var latest: Observation
   public var samples: [Observation]
   public var missingSince: Date?
+  /// Set when the process was seen with a live parent and later reparented to launchd.
   public var orphanSince: Date?
+  /// Last observation with noticeable CPU use; nil means idle since first seen.
+  public var lastBusy: Date?
   public var protection: Bool = false
   public var ignoreUntil: Date?
   public var alertedAt: Date?
@@ -130,6 +136,7 @@ public struct Finding: Identifiable, Sendable {
 }
 
 public struct CleanupEvent: Codable, Identifiable, Sendable {
+  public var fixture: Bool?
   public var id = UUID()
   public var leaseID: UUID
   public var label: String
@@ -178,14 +185,19 @@ public struct RecurrenceScope: Codable, Sendable {
 public struct Preferences: Codable, Sendable {
   public var automaticCleanup = false
   public var notifications = false
+  public var notificationBudget: Int?
+  public var notificationDetails: Bool?
+  public var shareDecisionHistory: Bool?
   public var protectedExecutables: Set<String> = []
   public init() {}
 }
 
 public struct Catalog: Codable, Sendable {
   public var version = 1
+  public var intentVersion: Int?
   public var workEvidence: [WorkEvidence]?
   public var passiveEvidence: [PassiveEvidence]?
+  public var pinnedOperationIDs: Set<String>?
   public var diskCandidates: [DiskCandidate]?
   public var diskDiscovery: [DiskSpaceNode]?
   public var diskReceipts: [DiskReceipt]?
@@ -228,20 +240,42 @@ public struct Catalog: Codable, Sendable {
       let keep = records.values.sorted { $0.latest.time > $1.latest.time }.prefix(4096)
       records = Dictionary(uniqueKeysWithValues: keep.map { ($0.id, $0) })
     }
+    let pinned = pinnedOperationIDs ?? []
     if let attempts = managedCacheAttempts {
+      let preserve = attempts.filter {
+        ["prepared", "uncertain"].contains($0.outcome) || pinned.contains($0.plan.id.uuidString)
+      }
+      let ids = Set(preserve.map { $0.plan.id })
       managedCacheAttempts =
-        attempts.filter { ["prepared", "uncertain"].contains($0.outcome) }
-        + Array(attempts.filter { !["prepared", "uncertain"].contains($0.outcome) }.suffix(500))
+        preserve + Array(attempts.filter { !ids.contains($0.plan.id) }.suffix(500))
     }
-    if let receipts = diskReceipts { diskReceipts = Array(receipts.suffix(500)) }
+    if let receipts = diskReceipts {
+      let preserve = receipts.filter {
+        !["verified", "refused"].contains($0.outcome) || pinned.contains($0.id.uuidString)
+      }
+      let ids = Set(preserve.map(\.id))
+      diskReceipts = preserve + Array(receipts.filter { !ids.contains($0.id) }.suffix(500))
+    }
     if let receipts = workspaceReceipts {
+      let preserve = receipts.filter {
+        !["verified", "refused"].contains($0.outcome) || pinned.contains($0.id.uuidString)
+      }
+      let ids = Set(preserve.map(\.id))
       workspaceReceipts =
-        receipts.filter { $0.outcome == "prepared" }
+        preserve
         + Array(
           receipts.filter {
-            $0.outcome != "prepared" && now.timeIntervalSince($0.verifiedAt ?? $0.date) < 30 * 86400
+            !ids.contains($0.id) && now.timeIntervalSince($0.verifiedAt ?? $0.date) < 30 * 86400
           }.suffix(500))
     }
-    events = Array(events.filter { now.timeIntervalSince($0.date) < 30 * 86400 }.suffix(500))
+    let preserve = events.filter {
+      !["verified", "refused"].contains($0.outcome) || pinned.contains($0.id.uuidString)
+    }
+    let ids = Set(preserve.map(\.id))
+    events =
+      preserve
+      + Array(
+        events.filter { !ids.contains($0.id) && now.timeIntervalSince($0.date) < 30 * 86400 }
+          .suffix(500))
   }
 }

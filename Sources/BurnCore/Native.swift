@@ -14,12 +14,19 @@ public enum Probe {
 public struct Native {
   public init() {}
   public func codexSessionID(_ expected: Observation) -> String? {
-    guard case .found(let before) = probe(expected.identity.pid), Member(before) == Member(expected) else { return nil }
+    codexSessionEvidence(expected).id
+  }
+  public func codexSessionEvidence(_ expected: Observation) -> (id: String?, status: String) {
+    guard case .found(let before) = probe(expected.identity.pid), Member(before) == Member(expected)
+    else { return (nil, "identity-changed") }
     var value = [CChar](repeating: 0, count: 37)
-    guard bz_codex_session(expected.identity.pid, &value, 37) == 1,
-      case .found(let after) = probe(expected.identity.pid), Member(after) == Member(expected),
-      let id = UUID(uuidString: String(cString: value)) else { return nil }
-    return id.uuidString.lowercased()
+    let result = bz_codex_session(expected.identity.pid, &value, 37)
+    guard case .found(let after) = probe(expected.identity.pid), Member(after) == Member(expected)
+    else { return (nil, "identity-changed") }
+    guard result == 1, let id = UUID(uuidString: String(cString: value)) else {
+      return (nil, result < 0 ? "metadata-unreadable" : "marker-absent")
+    }
+    return (id.uuidString.lowercased(), "bound-marker")
   }
   public var awakeSeconds: Double { Double(bz_awake_ns()) / 1e9 }
   public var boot: UInt64 { bz_boot() }
@@ -46,9 +53,38 @@ public struct Native {
           parent: raw.ppid, uid: raw.uid, executable: path, rss: raw.rss, cpuNS: raw.cpu_ns,
           readBytes: raw.disk_read, writeBytes: raw.disk_write, fds: Int(raw.fds),
           threads: Int(raw.threads), zombie: raw.status == 5, metricsValid: raw.metrics_valid == 1,
-          time: now, monotonic: Double(bz_continuous_ns()) / 1e9))
+          time: now, monotonic: Double(bz_continuous_ns()) / 1e9, pgid: raw.pgid))
     default: return .unknown
     }
+  }
+  /// True when the process owns a listening TCP socket; nil when it cannot be inspected.
+  public func listening(_ pid: Int32) -> Bool? {
+    switch bz_listening(pid) {
+    case 1: return true
+    case 0: return false
+    default: return nil
+    }
+  }
+  /// Which agent harness launched the process, from environment variable names only.
+  public func agent(_ pid: Int32) -> String? {
+    let mask = bz_agent_markers(pid)
+    guard mask >= 0 else { return nil }
+    if mask & 1 != 0 { return "claude" }
+    if mask & 2 != 0 { return "codex" }
+    if mask & 4 != 0 { return "cursor" }
+    return "none"
+  }
+  /// The live command line for inspection. Never persisted.
+  public func commandLine(_ pid: Int32, limit: Int = 600) -> String? {
+    var buffer = [CChar](repeating: 0, count: limit + 1)
+    guard bz_command_line(pid, &buffer, Int32(buffer.count)) == 1 else { return nil }
+    return String(cString: buffer)
+  }
+  public func currentDirectory(_ pid: Int32) -> String? {
+    var buffer = [CChar](repeating: 0, count: 4096)
+    guard bz_cwd(pid, &buffer, Int32(buffer.count)) == 1 else { return nil }
+    let path = String(cString: buffer)
+    return path.isEmpty ? nil : path
   }
   public func ownerState(_ identity: ProcessIdentity) -> OwnerState {
     let boot = bz_boot()
@@ -102,18 +138,27 @@ public struct Native {
       "\(count) descriptors · \(sockets) sockets · \(files) file handles. Socket endpoints and file contents are not collected."
   }
   public func workingDirectory(_ expected: Observation) -> String? {
-    guard case .found(let current) = probe(expected.identity.pid), current.identity == expected.identity else { return nil }
+    guard case .found(let current) = probe(expected.identity.pid),
+      current.identity == expected.identity
+    else { return nil }
     var path = [CChar](repeating: 0, count: 4096)
     guard bz_cwd(expected.identity.pid, &path, Int32(path.count)) == 1,
-      case .found(let after) = probe(expected.identity.pid), after.identity == expected.identity else { return nil }
+      case .found(let after) = probe(expected.identity.pid), after.identity == expected.identity
+    else { return nil }
     return String(cString: path)
   }
 }
 
 public final class InstanceLock {
   private let fd: Int32
-  public init(url: URL) throws {
-    fd = bz_lock(url.path)
+  public init(url: URL, timeout: TimeInterval = 0) throws {
+    let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
+    var acquired = bz_lock(url.path)
+    while acquired < 0 && ProcessInfo.processInfo.systemUptime < deadline {
+      Thread.sleep(forTimeInterval: 0.01)
+      acquired = bz_lock(url.path)
+    }
+    fd = acquired
     if fd < 0 {
       throw StoreError.message("Another instance is running, or the private lock is unavailable.")
     }

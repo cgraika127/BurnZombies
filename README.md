@@ -2,11 +2,17 @@
 
 # BurnZombies
 
-**Keep your agents running. Lose the leftovers.**
+**Keep your agents running. Lose the leftovers — on autopilot.**
 
-Long sessions leave a mess: abandoned Node workers, forgotten browser helpers, repeated build caches and worktrees full of yesterday's output. Eventually your Mac pays for work that already ended.
+Long agent sessions leave a mess: orphaned Node workers, robot browsers, build watchers, worktrees nobody opens again and gigabytes of rebuildable junk. BurnZombies sweeps your whole Mac every 15 minutes, burns what is safe, and when it isn't sure it asks you one tiny yes/no question. Every answer becomes a rule. After about a dozen answers it runs itself.
 
-BurnZombies watches your whole Mac—across projects, terminals, agents and old sessions. **Your existing harness supplies the intelligence. BurnZombies runs quietly in the background, cleans up confirmed leftovers and shows what you got back.** No active chat. No reboot.
+| It burns | How |
+| --- | --- |
+| 🧟 **Zombies** — programs whose app or chat is gone | A graceful stop. Programs a live chat is using are never touched. |
+| 📁 **Old copies** — git worktrees you stopped using | Every commit and change is saved in a restore point first. One click restores it. |
+| 🗑️ **Junk folders** — `node_modules`, build output, DerivedData | Deleted; your tools rebuild them when needed. |
+
+Your existing harness (Claude Code by default, or Codex) does the thinking in short headless sweeps; native code supplies facts, enforces the safety rails and verifies every result. [How Autopilot decides →](docs/AUTOPILOT.md)
 
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-242420?logo=apple&logoColor=white)](#install)
 [![MCP ready](https://img.shields.io/badge/MCP-ready-ff541f)](docs/MCP.md)
@@ -14,11 +20,17 @@ BurnZombies watches your whole Mac—across projects, terminals, agents and old 
 
 ## Install
 
+**Installing with an agent?** Give Codex or Claude Code this prompt:
+
+> Install and set up BurnZombies using https://raw.githubusercontent.com/swordfish444/BurnZombies/main/llms.txt. Preserve my existing agent settings and verify setup without running cleanup.
+
+The [agent setup guide](https://raw.githubusercontent.com/swordfish444/BurnZombies/main/llms.txt) covers both harnesses, permissions, updates and read-only verification.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/swordfish444/BurnZombies/main/install.sh | bash
 ```
 
-Apple Silicon or Intel, macOS 14+. The installer selects an available **Codex, Claude Code, Cursor CLI, GitHub Copilot CLI or Gemini CLI**, starts the menu bar observer, and configures one background reviewer. The reviewer connects privately when needed; everyday chats get no hooks or always-loaded MCP connection. Use your existing harness login. No BurnZombies account, API key or package manager.
+Apple Silicon or Intel, macOS 14+. The installer selects an available **Codex or Claude Code**, starts the menu bar observer, and configures one background reviewer. The reviewer connects privately when needed; everyday chats get no hooks or always-loaded MCP connection. Use your existing harness login. No BurnZombies account, API key or package manager. Add `--observe-only` to leave AI reviews disabled during setup. New installations require cleanup approval or an explicit scoped rule.
 
 **One required macOS step:** click **Allow Full Disk Access** in the menu-bar banner to open the right System Settings pane, then enable **BurnZombies**. Return to the app and it checks access automatically. If macOS asks, choose **Quit & Reopen**; the access check continues automatically after relaunch. macOS requires you to grant the permission yourself; your agent handles the installation.
 
@@ -39,6 +51,10 @@ Want to choose the brain? **Settings → Review intelligence** lets you set the 
 Installing through an agent? Tell it:
 
 > **Install BurnZombies to watch this Mac and clean up abandoned agent helpers in the background.**
+
+## Teach BZ in a dozen taps
+
+When Autopilot isn't sure, the menu shows **BZ has 3 quick questions**. Each one is a single card — "Can I burn old copies of your projects that are already saved on GitHub? I found 212 like this, using 48 GB." — with **Yes, burn them** and **No, keep them**. Yes burns the matches right away and every future match; No protects them for good. **Findings** shows everything in plain words: what it is, why BZ thinks so, and what happens if it burns it, with technical details tucked away. Settings → **What BZ has learned** lists every rule with a Forget button.
 
 ## Dead weight. Gone.
 
@@ -74,12 +90,13 @@ Automatic hunts run **every 4 hours** by default. Change the frequency or turn t
 
 - **Your whole Mac.** All visible processes owned by your macOS user, across projects and sessions—not just the current agent's children.
 - **Works with no chat open.** The resident observer schedules reviews. No tool-use hooks or conversation reminders.
-- **Retires idle build workers safely.** Gradle reports its own state. Your AI selects an exact idle daemon; Gradle finishes any build that races the request before exiting. BZ verifies the exit before crediting memory. The first native adapter supports Gradle 8.14.6.
+- **Asks before new cleanup permissions.** Open **Findings** to review exact evidence, approve one action, Keep a resource or snooze it. Optional recurring rules start with a single canary, have a cap and expiry, and never expand themselves. Shadow rules only show matches. Notifications default to private summaries; ignored notifications grant nothing.
+- **Retires idle build workers safely.** Gradle reports its own state. Your AI selects an exact idle daemon; Gradle finishes any build that races the request before exiting. BZ verifies the exit before crediting memory. The native adapter supports exactly Gradle 8.14.6 and 9.8.2.
 - **Reclaims owner-managed cache.** Local Docker build-cache records are checked individually against live references, retention and your disk policy. Containers, images, volumes and recent/shared cache stay protected. Automatic cleanup is opt-in under Disk cleanup; released Docker capacity is tracked separately from physical Mac disk space.
 - **Remembers what finished.** Native ownership and bounded completion evidence feed a shared queue. A finished turn alone never authorizes a kill; active consumers keep their helpers.
 - **Your harness does the thinking.** Model reasoning and live ownership evidence decide what is abandoned. No fixed “old process = zombie” rule.
 - **Review finished worktrees.** Inventory existing linked checkouts, inspect owners and local work, and explicitly manage eligible checkouts. Clean retirement and manual dirty retirement preserve independently verified encrypted recovery first. Active consumers and unknown inspection stay protected; Codex-managed checkouts remain with their owning tool. [Worktree cleanup →](docs/WORKTREE-CLEANUP.md)
-- **Find the big pockets.** **Settings → Disk cleanup** follows storage across your Mac, including folders outside agent worktrees. Your AI investigates what created it, groups repeated outputs and gives you a practical next step. Cards start at 10 GB of measured unshared storage; APFS copies don't inflate the number. Scanning uses no AI tokens. Already use Mole? Its storage analysis adds context to the same bounded review. [Disk discovery & cleanup →](docs/DISK-CLEANUP.md) · [Mole integration →](docs/MOLE-INTEGRATION.md)
+- **Find the big pockets.** **Settings → Disk cleanup** follows storage across your Mac, including folders outside agent worktrees. Your AI investigates what created it, groups repeated outputs and gives you a practical next step. Review cards start at 100 MB of observed storage. Automatic cache cleanup keeps its separate 10 GB floor; APFS copies are not advertised as independently reclaimable blocks. Scanning uses no AI tokens. Already use Mole? Its storage analysis adds context to the same bounded review. [Disk discovery & cleanup →](docs/DISK-CLEANUP.md) · [Mole integration →](docs/MOLE-INTEGRATION.md)
 - **Keep the good stuff alive.** Exact identities, protected harnesses, graceful stops and verified receipts. Uncertain work stays running.
 - **See the payoff.** Zombies burned, memory released, disk reclaimed, worktrees cleaned and a concrete cleanup benefit in a quiet menu bar app.
 - **Spends tokens on useful work.** Reviews get a small, focused evidence batch and only the tools it needs. Completed work stays quiet, unfinished investigations stay queued, and automatic hunts default to every four hours. Change the schedule or hunt manually whenever you need it. No daily token cutoff strands useful work. Failures pause instead of retrying. No windows open when reviews start.

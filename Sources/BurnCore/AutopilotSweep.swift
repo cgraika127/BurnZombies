@@ -2,7 +2,8 @@ import Foundation
 
 /// When to tick natively, when to spend an AI sweep, and how failures back off.
 public enum AutopilotSweeper {
-  public static let aiTimeout: TimeInterval = 600
+  /// The review worker's own maximum: a real Mac's first sweep read for nine minutes.
+  public static let aiTimeout: TimeInterval = 900
   public static let rejudgeInterval: TimeInterval = 4 * 3600
   public static let minimumSpacing: TimeInterval = 30 * 60
 
@@ -52,6 +53,7 @@ public enum AutopilotSweeper {
 
 /// Launches one AI sweep in the selected harness with the autopilot MCP tools.
 public enum AutopilotHarness {
+  public static let outOfTime = "The AI sweep ran out of time."
   public static let prompt = """
     You are BurnZombies Autopilot, the cleanup brain for this Mac. You sweep for leftovers — zombie programs, old project copies (git worktrees) and junk folders — burn what is safe, and learn what the owner wants. Goal: burn as much as is safely possible with no human help. Ask only when you truly can't tell.
 
@@ -187,7 +189,7 @@ public enum AutopilotHarness {
       Data(data), to: root.appendingPathComponent("last-review.log"), limit: 1_048_576)
     let text = String(decoding: data, as: UTF8.self)
     if process.terminationStatus == 124 {
-      throw StoreError.message("The AI sweep ran out of time.")
+      throw StoreError.message(outOfTime)
     }
     guard process.terminationStatus == 0 else {
       throw StoreError.message(
@@ -216,6 +218,8 @@ public actor AutopilotCoordinator {
   let configuration: @Sendable () -> MachineReviewConfiguration?
   let runner: @Sendable (MachineReviewConfiguration, URL) throws -> String
   var aiTask: Task<Void, Never>?
+  /// Set on the first tick, before anything here can start a sweep.
+  var launched = false
 
   public init(
     root: URL = Store.defaultRoot, engine: Autopilot,
@@ -237,6 +241,17 @@ public actor AutopilotCoordinator {
   @discardableResult public func tick(now: Date = Date(), manual requestedNow: Bool = false) async
     -> AutopilotSnapshot
   {
+    // A sweep still marked running at launch was cut short when the app quit; left alone it
+    // would block every sweep after it.
+    if !launched {
+      launched = true
+      if await engine.sweepState().running {
+        await engine.updateSweep {
+          $0.running = false
+          $0.append("The last AI sweep was cut short when the app quit.")
+        }
+      }
+    }
     let state = await engine.sweepState()
     let manual = requestedNow || state.requested == true
     let snapshot =
@@ -298,19 +313,18 @@ public actor AutopilotCoordinator {
 
   func finishAI(_ result: Result<String, Error>, digest: String, started: Date) async {
     let now = Date()
-    switch result {
-    case .success:
-      await engine.updateSweep {
-        $0.running = false
-        $0.failures = 0
-        $0.retryAfter = nil
-        $0.lastError = nil
-        $0.lastAISweep = now
-        $0.lastAIDigest = digest
-        $0.append("AI sweep finished in \(Int(now.timeIntervalSince(started))) s.")
-      }
-    case .failure(let error):
-      let message = error.localizedDescription
+    // A backlog can outlast any sweep: one that judged things before its time ran out did its
+    // job, and the next sweep picks up the rest instead of backing off.
+    var failure: String?
+    if case .failure(let error) = result { failure = error.localizedDescription }
+    var note = "AI sweep finished in \(Int(now.timeIntervalSince(started))) s."
+    if failure == AutopilotHarness.outOfTime,
+      await engine.memory().judgments.values.contains(where: { $0.date >= started })
+    {
+      failure = nil
+      note = "AI sweep used all its time; the next one picks up where it left off."
+    }
+    if let message = failure {
       await engine.updateSweep {
         $0.running = false
         $0.failures += 1
@@ -319,6 +333,16 @@ public actor AutopilotCoordinator {
           AutopilotSweeper.backoff(
             failures: $0.failures, accountProblem: AutopilotSweeper.accountProblem(message)))
         $0.append(message + " I'll try again later; my rules keep working meanwhile.")
+      }
+    } else {
+      await engine.updateSweep {
+        $0.running = false
+        $0.failures = 0
+        $0.retryAfter = nil
+        $0.lastError = nil
+        $0.lastAISweep = now
+        $0.lastAIDigest = digest
+        $0.append(note)
       }
     }
     let after = await engine.tick(now: now)

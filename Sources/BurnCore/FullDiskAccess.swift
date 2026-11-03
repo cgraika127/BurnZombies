@@ -17,7 +17,7 @@ public struct FullDiskAccessStatus: Codable, Sendable, Equatable {
 }
 
 public enum FullDiskAccess {
-  public static let instructions = "Enable BurnZombies in System Settings → Privacy & Security → Full Disk Access, then check access in BurnZombies Settings. Scans and AI reviews wait until setup is complete."
+  public static let instructions = "AI hunts and the places macOS protects need Full Disk Access; everything else works without it. To add them, turn on BurnZombies in System Settings → Privacy & Security → Full Disk Access, then check access in BurnZombies Settings."
   private struct Receipt: Codable {
     var executableDigest: String
     var verified: Bool
@@ -40,9 +40,17 @@ public enum FullDiskAccess {
     return identity(certificate: bundle.flatMap(leafCertificate), executable: data)
   }()
 
+  /// The last answer, for five seconds: callers ask about every step of their work, each
+  /// verified check opens two protected folders, and one stray failure would end access
+  /// until the user checks again.
+  nonisolated(unsafe) private static var recent: (root: String, status: FullDiskAccessStatus, at: TimeInterval)?
   public static func status(root: URL = Store.defaultRoot) -> FullDiskAccessStatus {
     lock.withLock {
-      status(root: root, identity: digest, probe: probe)
+      let now = ProcessInfo.processInfo.systemUptime
+      if let recent, recent.root == root.path, now - recent.at < 5 { return recent.status }
+      let result = status(root: root, identity: digest, probe: probe)
+      recent = (root.path, result, now)
+      return result
     }
   }
   // Injectable functions keep tests off protected user paths; production has no
@@ -62,7 +70,10 @@ public enum FullDiskAccess {
     return result
   }
   public static func confirmSetup(root: URL = Store.defaultRoot) throws -> FullDiskAccessStatus {
-    try lock.withLock { try confirmSetup(root: root, identity: digest, probe: probe) }
+    try lock.withLock {
+      recent = nil
+      return try confirmSetup(root: root, identity: digest, probe: probe)
+    }
   }
   public static func confirmSetup(root: URL, identity executableDigest: String?, probe: () -> FullDiskAccessStatus) throws -> FullDiskAccessStatus {
     guard let executableDigest else { return .init(state: .unknown, detail: "This app build could not be verified. Reinstall BurnZombies before checking access.") }
@@ -140,6 +151,6 @@ public enum FullDiskAccess {
       }
     }
     if readable && !unavailable { return .init(state: .granted, detail: "Protected-folder access verified for this app. Each cleanup still requires its own safety checks.") }
-    return .init(state: .unknown, detail: "Access could not be verified on this Mac. Scans remain paused; confirm Full Disk Access in System Settings and check again.")
+    return .init(state: .unknown, detail: "Access could not be verified on this Mac, so BurnZombies keeps skipping the places macOS protects. Confirm Full Disk Access in System Settings and check again.")
   }
 }

@@ -269,6 +269,25 @@ public enum AutopilotPolicy {
       kind: kind, match: widen(match, verdict: .burn), verdict: .burn, source: .operator, title: "")
   }
 
+  /// Every current item an open question is about, not only the three examples on its card.
+  /// Uses the same widened pattern and undecided items as question refresh. A failed receipt can
+  /// cover an otherwise undecided item; an authority still means it was decided independently.
+  /// This only reads the snapshot: it neither answers the question nor authorizes cleanup.
+  public static func questionItems(
+    _ question: AutopilotQuestion, entries: [AutopilotEntry]
+  ) -> [AutopilotItem] {
+    guard question.isOpen else { return [] }
+    let rule = coverage(question.kind, question.match)
+    return entries.filter { entry in
+      let undecided =
+        entry.status == .unsure
+        || (entry.status == .failed && entry.authority == nil)
+      return undecided && entry.item.protectedReason == nil && matches(rule, entry.item)
+    }.map(\.item).sorted { lhs, rhs in
+      lhs.bytes != rhs.bytes ? lhs.bytes > rhs.bytes : lhs.id < rhs.id
+    }
+  }
+
   /// A question about the things a pattern covers, with their count, size and cautions, and what
   /// its card names about them (`describe`).
   static func question(

@@ -133,6 +133,7 @@ private func require(_ reading: Reading, _ phrases: [String], in name: String) t
   let scratch = directory.appendingPathComponent("scratch-state", isDirectory: true)
   try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
   var notes = [String]()
+  try teachDeletionPreviewProof(directory: directory)
   func hint(_ reading: Reading, _ name: String, _ phrases: [String]) {
     let missing = phrases.filter { !reading.has($0) }
     if !missing.isEmpty { notes.append("\(name): OCR did not read \(missing.joined(separator: ", "))") }
@@ -955,6 +956,93 @@ private func require(_ reading: Reading, _ phrases: [String], in name: String) t
     throw StoreError.message("Autopilot proof showed a window")
   }
   print("PASS autopilot UI: menu, Teach BZ, Findings, Settings and every command render and behave from the demo snapshot; no window was shown or focused (PNGs in \(directory.path))")
+}
+
+/// Fixture-only previews for the full Teach BZ item list. Exercise the actual native views
+/// offscreen, so producing PR screenshots cannot focus the app, read a catalog or start cleanup.
+@MainActor func teachDeletionPreviewProof(output: String) throws {
+  NSApp.setActivationPolicy(.prohibited)
+  NSApp.appearance = NSAppearance(named: .darkAqua)
+  BurnTheme.registerFonts()
+  let directory = URL(fileURLWithPath: output, isDirectory: true)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  try teachDeletionPreviewProof(directory: directory)
+}
+
+@MainActor private func teachDeletionPreviewProof(directory: URL) throws {
+  let labels = [
+    ("invoice-pdf-export", "api", "Invoice PDF export", UInt64(1_800_000_000)),
+    ("checkpoint-map", "dashboard", "Checkpoint map", UInt64(1_200_000_000)),
+    ("camera-upload-retry", "mobile", "Camera upload retry", UInt64(900_000_000)),
+    ("login-timeout", "api", "Login timeout", UInt64(600_000_000)),
+    ("report-filters", "dashboard", "Report filters", UInt64(400_000_000)),
+  ]
+  let items = labels.enumerated().map { index, label in
+    AutopilotItem(
+      id: "worktree:preview-\(index)", kind: .worktree, name: label.0,
+      path: "/Users/demo/Projects/worktrees/\(label.1)/\(label.0)", bytes: label.3,
+      facts: [
+        "repo": label.1, "stale": "week", "saved": index == 0 ? "local" : "merged",
+        "changes": index == 0 ? "small" : "none", "inUse": "no", "thread": "ended",
+        "place": "other",
+      ], lastUsed: Date().addingTimeInterval(-9 * 86_400), title: label.2)
+  }
+  guard let question = AutopilotPolicy.proposeQuestions(
+    items, memory: AutopilotMemory()
+  ).first else { throw StoreError.message("Preview fixture needs a question") }
+  let model = AppModel(demo: true)
+  model.autopilot = AutopilotSnapshot()
+  model.autopilot.questions = [question]
+  model.autopilot.entries = items.map {
+    AutopilotEntry(item: $0, status: .unsure, authority: nil, label: $0.name, why: "Fixture", consequence: "Fixture")
+  }
+  let before = model.autopilot
+  let card = try render(
+    TeachView(model: model), size: TeachView.size, name: "teach-preview-question",
+    directory: directory)
+  try require(card, ["View what's going to be deleted", "Yes, burn them", "No, keep them"],
+    in: "teach-preview-question")
+  let list = try render(
+    TeachView(model: model, previewQuestionID: question.id), size: TeachView.size,
+    name: "teach-preview-list", directory: directory)
+  try require(
+    list, ["Back to question", "5 items", "4.9 GB", "on disk", "Invoice PDF export", "1.8 GB",
+      "Local-only work", "Uncommitted changes", "/Users/demo/Projects/worktrees/api/invoice-pdf-export"],
+    in: "teach-preview-list")
+  guard !list.has("Yes, burn them"), model.autopilot == before else {
+    throw StoreError.message("Viewing the item list must not offer cleanup or change the snapshot")
+  }
+  // An item disappearing or receiving a keep is reflected in the same view immediately.
+  model.autopilot.entries[0].status = .keep
+  let updated = try render(
+    TeachView(model: model, previewQuestionID: question.id), size: TeachView.size,
+    name: "teach-preview-updated", directory: directory)
+  try require(updated, ["4 items", "3.1 GB"], in: "teach-preview-updated")
+  guard !updated.has("Invoice PDF export") else {
+    throw StoreError.message("Kept items must disappear from the preview")
+  }
+  model.autopilot.questions = []
+  let empty = try render(
+    TeachView(model: model, previewQuestionID: question.id), size: TeachView.size,
+    name: "teach-preview-empty", directory: directory)
+  try require(empty, ["Nothing to list right now", "This question is no longer waiting", "Back to question"],
+    in: "teach-preview-empty")
+  // Programs show memory rather than disk space, plus their PID and executable path.
+  let program = AutopilotItem(
+    id: "process:preview", kind: .process, name: "node in api", path: "/usr/local/bin/node",
+    bytes: 750_000_000, facts: ["family": "node", "idle": "1h"], pid: 12345)
+  let processQuestion = AutopilotQuestion(
+    kind: .process, match: ["family": ["node"], "idle": ["1h"]], question: "", why: "",
+    examples: [], count: 1, bytes: program.bytes)
+  model.autopilot.questions = [processQuestion]
+  model.autopilot.entries = [
+    AutopilotEntry(item: program, status: .unsure, authority: nil, label: program.name, why: "Fixture", consequence: "Fixture")
+  ]
+  let memory = try render(
+    TeachView(model: model, previewQuestionID: processQuestion.id), size: TeachView.size,
+    name: "teach-preview-memory", directory: directory)
+  try require(memory, ["Programs to stop", "memory", "750 MB", "PID 12345"], in: "teach-preview-memory")
+  print("PASS Teach BZ read-only item list: full paths, sizes, risks, updates, empty state and memory")
 }
 
 /// The AppModel commands, with no engine attached (in-memory) and with a stand-in engine.

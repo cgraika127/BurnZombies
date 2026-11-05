@@ -42,10 +42,14 @@ struct TeachView: View {
   @State private var answeredIDs = Set<String>()
   /// The question on screen. It stays until it is answered or gone, whatever arrives meanwhile.
   @State private var pinnedQuestionID: String?
+  @State private var previewQuestionID: String?
 
-  init(model: AppModel, confirmation: Confirmation? = nil) {
+  init(
+    model: AppModel, confirmation: Confirmation? = nil, previewQuestionID: String? = nil
+  ) {
     self.model = model
     _confirmation = State(initialValue: confirmation)
+    _previewQuestionID = State(initialValue: previewQuestionID)
   }
 
   @MainActor static func makeWindow(model: AppModel) -> NSWindow {
@@ -94,9 +98,15 @@ struct TeachView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      header
-      Rectangle().fill(BurnTheme.line).frame(height: 1)
-      content.frame(maxWidth: .infinity, maxHeight: .infinity)
+      if let previewQuestionID {
+        TeachDeletionPreview(model: model, questionID: previewQuestionID) {
+          self.previewQuestionID = nil
+        }
+      } else {
+        header
+        Rectangle().fill(BurnTheme.line).frame(height: 1)
+        content.frame(maxWidth: .infinity, maxHeight: .infinity)
+      }
     }
     .foregroundStyle(BurnTheme.cream)
     .background(BurnBackdrop())
@@ -159,7 +169,10 @@ struct TeachView: View {
         HStack(spacing: 6) {
           ForEach(0..<min(total, 8), id: \.self) { index in
             Circle().fill(index < answeredHere ? BurnTheme.orange : Color.white.opacity(0.2))
-              .overlay(Circle().strokeBorder(index == answeredHere ? BurnTheme.orange : .clear, lineWidth: 2))
+              .overlay(
+                Circle().strokeBorder(
+                  index == answeredHere ? BurnTheme.orange : .clear, lineWidth: 2)
+              )
               .frame(width: 10, height: 10)
           }
         }
@@ -183,6 +196,22 @@ struct TeachView: View {
         if let line = card.line, !line.isEmpty { safeLine(line) }
         if !card.facts.isEmpty { facts(card.facts, cautions: Set(card.cautions)) }
         TeachRows(rows: card.rows, more: card.more)
+        Button {
+          pinnedQuestionID = question.id
+          previewQuestionID = question.id
+        } label: {
+          Label(
+            question.kind == .process
+              ? "View programs to stop" : "View what's going to be deleted",
+            systemImage: "list.bullet"
+          )
+          .font(.system(size: 14, weight: .semibold))
+          .foregroundStyle(BurnTheme.cream)
+          .padding(.horizontal, 14).padding(.vertical, 9)
+          .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 9))
+          .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(BurnTheme.line))
+        }
+        .buttonStyle(.plain).clickPointer().accessibilityIdentifier("teach-view-items")
         Text(card.note).font(.system(size: 14)).foregroundStyle(BurnTheme.muted)
           .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
       }
@@ -232,13 +261,17 @@ struct TeachView: View {
           ForEach(facts[start..<min(start + 2, facts.count)], id: \.self) { fact in
             let caution = cautions.contains(fact)
             HStack(spacing: 5) {
-              if caution { Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11)) }
+              if caution {
+                Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11))
+              }
               Text(fact)
             }
             .font(.system(size: 13.5, weight: .semibold))
             .foregroundStyle(caution ? Color.orange : BurnTheme.cream)
             .padding(.horizontal, 12).padding(.vertical, 5)
-            .background(caution ? Color.orange.opacity(0.14) : Color.white.opacity(0.08), in: Capsule())
+            .background(
+              caution ? Color.orange.opacity(0.14) : Color.white.opacity(0.08), in: Capsule()
+            )
             .overlay(Capsule().strokeBorder(caution ? Color.orange.opacity(0.5) : BurnTheme.line))
           }
         }
@@ -437,6 +470,111 @@ struct TeachView: View {
     case .skip:
       return Confirmation(text: "No problem. I'll ask again tomorrow.", symbol: "clock.fill")
     }
+  }
+}
+
+/// A read-only list of every current item covered by the question, not just its three examples.
+/// It follows the same snapshot as the question. Entering or leaving it never sends a command.
+struct TeachDeletionPreview: View {
+  @ObservedObject var model: AppModel
+  let questionID: String
+  let back: () -> Void
+
+  private var question: AutopilotQuestion? {
+    model.autopilot.questions.first { $0.id == questionID && $0.isOpen }
+  }
+
+  private var items: [AutopilotItem] {
+    guard let question else { return [] }
+    return AutopilotPolicy.questionItems(question, entries: model.autopilot.entries)
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      VStack(alignment: .leading, spacing: 10) {
+        Button(action: back) {
+          Label("Back to question", systemImage: "chevron.left")
+        }
+        .buttonStyle(.plain).clickPointer().foregroundStyle(BurnTheme.orange)
+        .accessibilityIdentifier("teach-preview-back")
+        Text(question?.kind == .process ? "Programs to stop" : "What's going to be deleted")
+          .font(.system(size: 23, weight: .bold, design: .rounded))
+        if let question {
+          let total = items.reduce(UInt64(0)) { $0 + $1.bytes }
+          HStack {
+            Text(items.count == 1 ? "1 item" : "\(items.count) items")
+            Spacer()
+            Text(
+              "\(AutopilotPolicy.format(total)) \(question.kind == .process ? "memory" : "on disk")"
+            )
+            .foregroundStyle(BurnTheme.orange)
+          }.font(.system(size: 15, weight: .semibold))
+          Text("Current matching items, largest first. BZ checks them again before cleanup.")
+            .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }.padding(24)
+      Rectangle().fill(BurnTheme.line).frame(height: 1)
+      if items.isEmpty {
+        VStack(spacing: 10) {
+          Text("Nothing to list right now.").font(.system(size: 17, weight: .semibold))
+          Text(
+            question == nil
+              ? "This question is no longer waiting." : "No current items match this question."
+          )
+          .font(.system(size: 14)).foregroundStyle(BurnTheme.muted)
+        }.frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        ScrollView {
+          LazyVStack(alignment: .leading, spacing: 0) {
+            ForEach(items) { item in
+              previewRow(item)
+              Rectangle().fill(BurnTheme.line).frame(height: 1)
+            }
+          }.padding(.horizontal, 24)
+        }.accessibilityIdentifier("teach-preview-list")
+      }
+      Rectangle().fill(BurnTheme.line).frame(height: 1)
+      Text("Viewing this list changes nothing. A Yes answer also applies to future matching items.")
+        .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+        .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 24).padding(
+          .vertical, 14)
+    }
+    .foregroundStyle(BurnTheme.cream)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private func previewRow(_ item: AutopilotItem) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack(alignment: .firstTextBaseline, spacing: 12) {
+        Text(item.title ?? item.name).font(.system(size: 15, weight: .semibold))
+          .fixedSize(horizontal: false, vertical: true)
+        Spacer(minLength: 0)
+        Text(AutopilotPolicy.format(item.bytes)).font(.system(size: 14, weight: .semibold))
+          .foregroundStyle(BurnTheme.orange).fixedSize()
+      }
+      if let repo = item.facts["repo"], repo != "none" {
+        Text(repo).font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+      }
+      if let path = item.path, !path.isEmpty {
+        Text(path).font(.system(size: 11, design: .monospaced))
+          .foregroundStyle(BurnTheme.muted).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      if let pid = item.pid {
+        Text("PID \(String(pid))").font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+      }
+      let cautions = [
+        item.facts["saved"] == "local" ? "Local-only work" : nil,
+        ["small", "large"].contains(item.facts["changes"] ?? "") ? "Uncommitted changes" : nil,
+        item.facts["inUse"] == "unknown" ? "Usage not checked" : nil,
+      ].compactMap { $0 }
+      if !cautions.isEmpty {
+        Text(cautions.joined(separator: " · "))
+          .font(.system(size: 12, weight: .medium)).foregroundStyle(Color.orange)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+    }.padding(.vertical, 12).accessibilityElement(children: .contain)
   }
 }
 

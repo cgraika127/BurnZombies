@@ -1663,6 +1663,15 @@ MainActor.assumeIsolated {
         exit(1)
       }
     }
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--teach-preview-proof" {
+      do {
+        try teachDeletionPreviewProof(output: CommandLine.arguments[2])
+        exit(0)
+      } catch {
+        print("FAIL \(error.localizedDescription)")
+        exit(1)
+      }
+    }
     if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--autopilot-proof" {
       do {
         try autopilotProof(output: CommandLine.arguments[2])

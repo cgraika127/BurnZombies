@@ -64,6 +64,7 @@ private func folderItem(_ id: String, bytes: UInt64, used: Date?) -> AutopilotIt
 func cardProof() async throws {
   try ownerCardProof()
   questionItemsProof()
+  itemCautionsProof()
   calendarWordsProof()
   clockProof()
   programWordsProof()

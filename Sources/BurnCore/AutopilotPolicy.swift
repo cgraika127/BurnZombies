@@ -269,15 +269,15 @@ public enum AutopilotPolicy {
       kind: kind, match: widen(match, verdict: .burn), verdict: .burn, source: .operator, title: "")
   }
 
-  /// Every current item an open question is about, not only the three examples on its card.
-  /// Uses the same widened pattern and undecided items as question refresh. A failed receipt can
-  /// cover an otherwise undecided item; an authority still means it was decided independently.
+  /// Every current undecided item a Yes would cover, not only the examples on its card.
+  /// Uses the actual Yes lesson, including generalized identity and approved-risk limits.
+  /// A failed receipt can cover an undecided item; an authority means it was decided independently.
   /// This only reads the snapshot: it neither answers the question nor authorizes cleanup.
   public static func questionItems(
     _ question: AutopilotQuestion, entries: [AutopilotEntry]
   ) -> [AutopilotItem] {
     guard question.isOpen else { return [] }
-    let rule = coverage(question.kind, question.match)
+    let rule = lesson(for: question, verdict: .burn, created: question.asked)
     return entries.filter { entry in
       let undecided =
         entry.status == .unsure

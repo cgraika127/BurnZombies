@@ -1007,7 +1007,7 @@ private func require(_ reading: Reading, _ phrases: [String], in name: String) t
     name: "teach-preview-list", directory: directory)
   try require(
     list, ["Back to question", "5 items", "4.9 GB", "on disk", "Invoice PDF export", "1.8 GB",
-      "Local-only work", "Uncommitted changes", "/Users/demo/Projects/worktrees/api/invoice-pdf-export"],
+      "work only on this Mac", "unsaved changes", "/Users/demo/Projects/worktrees/api/invoice-pdf-export"],
     in: "teach-preview-list")
   guard !list.has("Yes, burn them"), model.autopilot == before else {
     throw StoreError.message("Viewing the item list must not offer cleanup or change the snapshot")
@@ -1030,7 +1030,7 @@ private func require(_ reading: Reading, _ phrases: [String], in name: String) t
   // Programs show memory rather than disk space, plus their PID and executable path.
   let program = AutopilotItem(
     id: "process:preview", kind: .process, name: "node in api", path: "/usr/local/bin/node",
-    bytes: 750_000_000, facts: ["family": "node", "idle": "1h"], pid: 12345)
+    bytes: 750_000_000, facts: ["family": "node", "idle": "1h", "listening": "yes"], pid: 12345)
   let processQuestion = AutopilotQuestion(
     kind: .process, match: ["family": ["node"], "idle": ["1h"]], question: "", why: "",
     examples: [], count: 1, bytes: program.bytes)
@@ -1041,7 +1041,14 @@ private func require(_ reading: Reading, _ phrases: [String], in name: String) t
   let memory = try render(
     TeachView(model: model, previewQuestionID: processQuestion.id), size: TeachView.size,
     name: "teach-preview-memory", directory: directory)
-  try require(memory, ["Programs to stop", "memory", "750 MB", "PID 12345"], in: "teach-preview-memory")
+  try require(
+    memory, ["Programs to stop", "memory", "750 MB", "PID 12345", "a running server"],
+    in: "teach-preview-memory")
+  model.autopilot.entries[0].item.facts["listening"] = "unknown"
+  let unchecked = try render(
+    TeachView(model: model, previewQuestionID: processQuestion.id), size: TeachView.size,
+    name: "teach-preview-unchecked", directory: directory)
+  try require(unchecked, ["PID 12345", "things I couldn't check"], in: "teach-preview-unchecked")
   print("PASS Teach BZ read-only item list: full paths, sizes, risks, updates, empty state and memory")
 }
 

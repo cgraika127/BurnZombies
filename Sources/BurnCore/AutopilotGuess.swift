@@ -34,6 +34,11 @@ extension AutopilotPolicy {
     return found.sorted()
   }
 
+  /// One item's cautions in the same plain words and order as the policy's risk explanations.
+  public static func itemCautions(_ item: AutopilotItem) -> [String] {
+    riskWords(Set(risks(item.kind, [item])))
+  }
+
   /// A stored question's risks: `risks` when set, otherwise from its match values plus caution
   /// text ("work only on this Mac" → saved=local, "unsaved changes" → changes=small,
   /// "running a server" → listening=yes).

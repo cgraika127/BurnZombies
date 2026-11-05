@@ -6,12 +6,15 @@ import Foundation
 func questionItemsProof() {
   func item(
     _ id: String, bytes: UInt64 = 1_000_000_000, kind: AutopilotKind = .worktree,
-    repo: String = "demo-api", stale: String = "week", protected: String? = nil
+    repo: String = "demo-api", stale: String = "week", protected: String? = nil,
+    saved: String = "local", changes: String = "small", inUse: String = "no"
   ) -> AutopilotItem {
     AutopilotItem(
       id: kind.rawValue + ":" + id, kind: kind, name: id,
       path: "/fixture/projects/" + repo + "/" + id, bytes: bytes,
-      facts: ["repo": repo, "stale": stale, "saved": "local", "changes": "small"],
+      facts: [
+        "repo": repo, "stale": stale, "saved": saved, "changes": changes, "inUse": inUse,
+      ],
       protectedReason: protected)
   }
   func entry(
@@ -28,13 +31,12 @@ func questionItemsProof() {
   let wanted = [
     item("one", stale: "day"), item("two", bytes: 2_000_000_000),
     item("three", bytes: 3_000_000_000, stale: "month"), item("four", stale: "older"),
-    item("five"),
+    item("five"), item("other-project", repo: "demo-docs"),
   ]
   let input =
     wanted.reversed().map { entry($0) } + [
       entry(item("recent", stale: "today")),
       entry(item("unknown-age", stale: "unknown")),
-      entry(item("other-project", repo: "demo-docs")),
       entry(item("other-kind", kind: .disk)),
       entry(item("main", protected: "Main project folder")),
       entry(item("protected"), .protected),
@@ -47,10 +49,10 @@ func questionItemsProof() {
   let questionBefore = question
   let rows = AutopilotPolicy.questionItems(question, entries: input)
   equal(
-    rows.map(\.name), ["three", "two", "five", "four", "one"],
+    rows.map(\.name), ["three", "two", "five", "four", "one", "other-project"],
     "every match, sorted by size and identity")
-  equal(rows.count, question.count, "no three-example limit")
-  equal(rows.reduce(0) { $0 + $1.bytes }, question.bytes, "total comes from every listed item")
+  equal(rows.count, 6, "a Yes also covers current matches in other projects")
+  equal(rows.reduce(0) { $0 + $1.bytes }, 9_000_000_000, "total includes the broader Yes scope")
   equal(Set(rows.map(\.path)), Set(wanted.map(\.path)), "exact paths survive the projection")
   equal(rows.first?.facts["saved"], "local", "the list retains per-item risk evidence")
   equal(input, before, "viewing leaves entries unchanged")
@@ -63,20 +65,49 @@ func questionItemsProof() {
     AutopilotPolicy.questionItems(question, entries: [failed]).map(\.name), ["retry"],
     "an undecided failure stays on the question")
 
+  // Modern questions preserve the risks the card showed, even when Yes generalizes its project.
+  // A preview must not authorize new risks by incorporating them from its additional matches.
+  question.risks = ["saved=local", "changes=small"]
+  question.profiles = [["saved=local", "stale=day"], ["changes=small", "stale=week"]]
+  let additional = item("approved-mix", repo: "demo-docs")
+  let unsafe = item("new-risk", repo: "demo-docs", changes: "large")
+  let unchecked = item("unchecked", repo: "demo-docs", inUse: "unknown")
+  let safe = item("safe", repo: "demo-docs", saved: "merged", changes: "none")
+  equal(
+    AutopilotPolicy.questionItems(
+      question, entries: [entry(additional), entry(unsafe), entry(unchecked), entry(safe)]),
+    [additional, safe], "Yes keeps its risk limits but permits combinations of approved risks")
+  question.risks = []
+  equal(
+    AutopilotPolicy.questionItems(question, entries: [entry(additional), entry(safe)]),
+    [safe], "an empty risk list permits safe values only")
+  question.risks = nil
+  equal(
+    AutopilotPolicy.questionItems(question, entries: [entry(unsafe)]), [unsafe],
+    "legacy questions retain their unrestricted risk behavior")
+
   // The same read works for folders and programs: use each question's kind and full pattern,
   // including widened idle ages, rather than treating every row as a project copy.
   question.kind = .process
-  question.match = ["family": ["node"], "idle": ["1h"]]
+  question.match = ["family": ["node"], "idle": ["1h"], "agent": ["codex"]]
+  question.risks = []
   let node = AutopilotItem(
     id: "process:node", kind: .process, name: "node", bytes: 150_000_000,
-    facts: ["family": "node", "idle": "6h"], pid: 123)
+    facts: ["family": "node", "idle": "6h", "agent": "claude", "listening": "no"], pid: 123)
   let python = AutopilotItem(
     id: "process:python", kind: .process, name: "python", bytes: 200_000_000,
-    facts: ["family": "python", "idle": "6h"], pid: 124)
+    facts: ["family": "python", "idle": "6h", "agent": "claude", "listening": "no"], pid: 124)
+  let server = AutopilotItem(
+    id: "process:server", kind: .process, name: "node server", bytes: 150_000_000,
+    facts: ["family": "node", "idle": "6h", "agent": "claude", "listening": "yes"], pid: 125)
+  let recent = AutopilotItem(
+    id: "process:recent", kind: .process, name: "recent node", bytes: 150_000_000,
+    facts: ["family": "node", "idle": "10m", "agent": "claude", "listening": "no"], pid: 126)
   equal(
     AutopilotPolicy.questionItems(
-      question, entries: [entry(node), entry(python), entry(wanted[0])]),
-    [node], "program family, kind and older idle ages")
+      question,
+      entries: [entry(node), entry(python), entry(server), entry(recent), entry(wanted[0])]),
+    [node], "Yes generalizes agent but preserves family, kind, idle age and listening risks")
 
   question.kind = .disk
   question.match = ["folder": ["package-cache"], "stale": ["week"]]

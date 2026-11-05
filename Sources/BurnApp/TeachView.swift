@@ -473,7 +473,7 @@ struct TeachView: View {
   }
 }
 
-/// A read-only list of every current item covered by the question, not just its three examples.
+/// A read-only list of every current undecided item a Yes would cover, not just its three examples.
 /// It follows the same snapshot as the question. Entering or leaving it never sends a command.
 struct TeachDeletionPreview: View {
   @ObservedObject var model: AppModel
@@ -484,13 +484,13 @@ struct TeachDeletionPreview: View {
     model.autopilot.questions.first { $0.id == questionID && $0.isOpen }
   }
 
-  private var items: [AutopilotItem] {
-    guard let question else { return [] }
-    return AutopilotPolicy.questionItems(question, entries: model.autopilot.entries)
-  }
-
   var body: some View {
-    VStack(alignment: .leading, spacing: 0) {
+    let question = self.question
+    let items =
+      question.map {
+        AutopilotPolicy.questionItems($0, entries: model.autopilot.entries)
+      } ?? []
+    return VStack(alignment: .leading, spacing: 0) {
       VStack(alignment: .leading, spacing: 10) {
         Button(action: back) {
           Label("Back to question", systemImage: "chevron.left")
@@ -509,9 +509,11 @@ struct TeachDeletionPreview: View {
             )
             .foregroundStyle(BurnTheme.orange)
           }.font(.system(size: 15, weight: .semibold))
-          Text("Current matching items, largest first. BZ checks them again before cleanup.")
-            .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
-            .fixedSize(horizontal: false, vertical: true)
+          Text(
+            "Current items a Yes could clean up, largest first. BZ checks them again before cleanup."
+          )
+          .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+          .fixedSize(horizontal: false, vertical: true)
         }
       }.padding(24)
       Rectangle().fill(BurnTheme.line).frame(height: 1)
@@ -535,10 +537,12 @@ struct TeachDeletionPreview: View {
         }.accessibilityIdentifier("teach-preview-list")
       }
       Rectangle().fill(BurnTheme.line).frame(height: 1)
-      Text("Viewing this list changes nothing. A Yes answer also applies to future matching items.")
-        .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
-        .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 24).padding(
-          .vertical, 14)
+      Text(
+        "Viewing this list changes nothing. A Yes rule can cover multiple projects and future matches."
+      )
+      .font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
+      .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 24).padding(
+        .vertical, 14)
     }
     .foregroundStyle(BurnTheme.cream)
     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -564,11 +568,7 @@ struct TeachDeletionPreview: View {
       if let pid = item.pid {
         Text("PID \(String(pid))").font(.system(size: 12)).foregroundStyle(BurnTheme.muted)
       }
-      let cautions = [
-        item.facts["saved"] == "local" ? "Local-only work" : nil,
-        ["small", "large"].contains(item.facts["changes"] ?? "") ? "Uncommitted changes" : nil,
-        item.facts["inUse"] == "unknown" ? "Usage not checked" : nil,
-      ].compactMap { $0 }
+      let cautions = AutopilotPolicy.itemCautions(item)
       if !cautions.isEmpty {
         Text(cautions.joined(separator: " · "))
           .font(.system(size: 12, weight: .medium)).foregroundStyle(Color.orange)

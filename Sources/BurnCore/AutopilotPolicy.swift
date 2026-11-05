@@ -124,7 +124,7 @@ public enum AutopilotPolicy {
     }
   }
 
-  static func subject(_ kind: AutopilotKind, _ match: [String: [String]]) -> String {
+  public static func subject(_ kind: AutopilotKind, _ match: [String: [String]]) -> String {
     kind.rawValue + ":" + (subjectFacts[kind].flatMap { match[$0]?.first } ?? "")
   }
 
@@ -154,15 +154,12 @@ public enum AutopilotPolicy {
   /// One yes/no question per subject with enough unsure things to be worth asking, biggest
   /// first. A question covers the most recent use not decided yet and everything older, so one
   /// answer can settle a whole subject; after a no the next question is about older things
-  /// only. Never re-asks an answered or open pattern; a skipped subject waits for its snooze.
+  /// only. Never re-asks an open pattern, nor one the owner already answered for the risks its
+  /// things carry (`answered`); a skipped subject waits for its snooze.
   public static func proposeQuestions(
     _ unsure: [AutopilotItem], memory: AutopilotMemory, limit: Int = maximumOpenQuestions,
     now: Date = Date()
   ) -> [AutopilotQuestion] {
-    let waiting = memory.questions.filter { waits($0, now: now) }
-    let excluded = Set(
-      memory.questions.filter { $0.answer == .yes || $0.answer == .no }.map(\.id)
-        + waiting.map(\.id))
     let slots = limit - memory.questions.filter(\.isOpen).count
     guard slots > 0 else { return [] }
     let busy = busySubjects(memory, now: now)
@@ -187,18 +184,19 @@ public enum AutopilotPolicy {
       if let key = subjectFacts[kind], let value = items[0].facts[key] { base[key] = [value] }
       let present = Set(items.compactMap { $0.facts[recency] })
       // The broadest question not asked yet: the most recent use present and everything older.
-      guard
-        let recent = (safety[recency] ?? []).first(where: { value in
-          present.contains(value)
-            && !excluded.contains(
-              AutopilotRule.key(kind: kind, match: base.merging([recency: [value]]) { a, _ in a }))
-        })
-      else { continue }
-      var match = base
-      match[recency] = [recent]
-      let covering = items.filter { matches(coverage(kind, match), $0) }
-      if covering.reduce(0, { $0 + $1.bytes }) >= worthAsking {
-        candidates.append(question(kind, match: match, covering: covering, now: now))
+      // An open or skipped question makes its subject busy, so only answers can rule one out.
+      for recent in safety[recency] ?? [] where present.contains(recent) {
+        var match = base
+        match[recency] = [recent]
+        let covering = items.filter { matches(coverage(kind, match), $0) }
+        let carried: [String] = risks(kind, covering)
+        if answered(kind, match, risks: carried, memory: memory) { continue }
+        if covering.reduce(0, { $0 + $1.bytes }) >= worthAsking {
+          var asked = question(kind, match: match, covering: covering, now: now)
+          asked.id = unusedID(asked.id, memory)
+          candidates.append(asked)
+        }
+        break
       }
     }
     return Array(
@@ -206,13 +204,66 @@ public enum AutopilotPolicy {
         .prefix(slots))
   }
 
-  /// What a yes to a pattern burns: the pattern and everything safer.
-  static func coverage(_ kind: AutopilotKind, _ match: [String: [String]]) -> AutopilotRule {
+  /// Whether the owner already answered a question about `match` for things carrying `risks`. An
+  /// answer from before cards named their risks answered the pattern whatever its things carry, as
+  /// it always did. A newer one answered only the risks its card showed, so things under the
+  /// pattern with a risk it didn't show get a question of their own. BZ's own answers leave the
+  /// pattern to the owner.
+  static func answered(
+    _ kind: AutopilotKind, _ match: [String: [String]], risks carried: [String],
+    memory: AutopilotMemory
+  ) -> Bool {
+    let need = Set(carried)
+    return memory.questions.contains { past in
+      guard past.kind == kind, past.match == match, ownerAnswered(past) else { return false }
+      guard let shown = past.risks else { return true }
+      return need.isSubset(of: Set(shown))
+    }
+  }
+
+  /// A native question's id: its pattern's key, then the risks its card shows when it shows any, so
+  /// that asking about the same pattern for new risks is a question of its own.
+  public static func nativeID(
+    _ kind: AutopilotKind, _ match: [String: [String]], risks: [String]
+  ) -> String {
+    let key: String = AutopilotRule.key(kind: kind, match: match)
+    guard !risks.isEmpty else { return key }
+    return key + ":" + risks.sorted().joined(separator: ",")
+  }
+
+  /// `id`, or `id` numbered when memory already holds a question with it: answered, skipped or open.
+  /// A pattern asked again, after a skip or for a card whose risks changed after its id was made, is
+  /// a question of its own, so an answer lands on the card the owner sees and never on an older one.
+  static func unusedID(_ id: String, _ memory: AutopilotMemory) -> String {
+    let taken = Set(memory.questions.map(\.id))
+    guard taken.contains(id) else { return id }
+    var n = 2
+    while taken.contains(id + "#\(n)") { n += 1 }
+    return id + "#\(n)"
+  }
+
+  /// The question an answer to `id` lands on: the open one, which is the card the owner sees. Memory
+  /// from before re-asked cards had ids of their own can hold a skipped question under the same id,
+  /// earlier in the list. With none open, the latest one answered Yes or No, so a second click
+  /// changes nothing; then the latest skipped one, which can still be answered.
+  static func answering(_ id: String, in questions: [AutopilotQuestion]) -> Int? {
+    let same: [Int] = questions.indices.filter { questions[$0].id == id }
+    if let open = same.first(where: { questions[$0].isOpen }) { return open }
+    let decided: Int? = same.last(where: { i in
+      questions[i].answer == .yes || questions[i].answer == .no
+    })
+    return decided ?? same.last
+  }
+
+  /// What a yes to a pattern burns: the pattern and everything safer. A question is about the
+  /// unsure things this covers.
+  public static func coverage(_ kind: AutopilotKind, _ match: [String: [String]]) -> AutopilotRule {
     AutopilotRule(
       kind: kind, match: widen(match, verdict: .burn), verdict: .burn, source: .operator, title: "")
   }
 
-  /// A question about the things a pattern covers, with their count, size and cautions.
+  /// A question about the things a pattern covers, with their count, size and cautions, and what
+  /// its card names about them (`describe`).
   static func question(
     _ kind: AutopilotKind, match: [String: [String]], covering: [AutopilotItem], now: Date
   ) -> AutopilotQuestion {
@@ -227,23 +278,33 @@ public enum AutopilotPolicy {
       examples: Array(covering.sorted { $0.bytes > $1.bytes }.prefix(3).map(\.name)),
       count: covering.count, bytes: bytes, asked: now)
     question.cautions = mix(kind, covering)
+    describe(&question, covering: covering)
+    question.id = nativeID(kind, match, risks: question.risks ?? [])
     return question
   }
 
-  /// What makes some of the matches riskier, counted: "2 have work only on this Mac".
+  /// What makes some of the matches riskier, counted: "2 have work only on this Mac". Small and
+  /// large unsaved changes are counted apart ("1 has lots of unsaved changes"). Things
+  /// whose saving, unsaved work, use or port BZ couldn't check are counted too, since a lesson
+  /// only covers them when a card said so.
   static func mix(_ kind: AutopilotKind, _ items: [AutopilotItem]) -> [String]? {
     func count(_ test: (AutopilotItem) -> Bool, _ one: String, _ many: String) -> String? {
       let n = items.filter(test).count
       return n == 0 ? nil : "\(n) " + (n == 1 ? one : many)
     }
-    let found: [String?]
+    let checked: [String] = (riskFacts[kind] ?? []).map(\.fact)
+    let unchecked: String? = count(
+      { item in checked.contains { item.facts[$0] == "unknown" } }, "couldn't be checked",
+      "couldn't be checked")
+    var found: [String?]
     switch kind {
     case .worktree:
       found = [
         count({ $0.facts["saved"] == "local" }, "has work only on this Mac", "have work only on this Mac"),
+        count({ $0.facts["changes"] == "small" }, "has unsaved changes", "have unsaved changes"),
         count(
-          { ["small", "large"].contains($0.facts["changes"] ?? "") }, "has unsaved changes",
-          "have unsaved changes"),
+          { $0.facts["changes"] == "large" }, "has lots of unsaved changes",
+          "have lots of unsaved changes"),
       ]
     case .process:
       found = [
@@ -253,6 +314,7 @@ public enum AutopilotPolicy {
       ]
     case .disk: found = []
     }
+    found.append(unchecked)
     let cautions = found.compactMap { $0 }
     return cautions.isEmpty ? nil : cautions
   }
@@ -415,24 +477,62 @@ public enum AutopilotPolicy {
 public struct AutopilotCard: Equatable, Sendable {
   public var headline: String
   public var frees: String
+  /// What is true of what it covers, in a few words each, with the counted cautions. How long it
+  /// sat unused is left out when the headline already says it.
   public var facts: [String]
   public var note: String
   public var yes: String
   public var no: String
   /// The facts that make burning riskier, shown so they stand out.
   public var cautions: [String] = []
+  /// What every one of the things shares that is safe, as one sentence.
+  public var line: String?
+  /// Up to three of the things the question is about, biggest first.
+  public var rows: [AutopilotCardRow] = []
+  /// How many more there are than the rows show.
+  public var more = 0
+}
+
+/// One thing a question is about, ready to show: what it is called, where it lives and when it
+/// was last used, in words that are right when the card is shown.
+public struct AutopilotCardRow: Equatable, Sendable {
+  public var title: String
+  public var subtitle: String?
+  public var when: String
+  public init(title: String, subtitle: String? = nil, when: String) {
+    self.title = title
+    self.subtitle = subtitle
+    self.when = when
+  }
 }
 
 extension AutopilotPolicy {
   static let stalePhrases = [
-    "day": "Unused since yesterday", "week": "Unused for a week", "month": "Unused for a month",
-    "older": "Unused for 3+ months",
+    "today": "Used in the last day", "day": "Unused since yesterday", "week": "Unused for a week",
+    "month": "Unused for a month", "older": "Unused for 3+ months",
   ]
+
+  /// The project a pattern names, when it names exactly one.
+  static func pinnedRepo(_ match: [String: [String]]) -> String? {
+    guard let repos = match["repo"], repos.count == 1, !["", "none"].contains(repos[0]) else {
+      return nil
+    }
+    return repos[0]
+  }
+
+  /// What a card's headline calls the things, singular and plural: "copy" and "copies", or "copy of
+  /// api" and "copies of api" when the pattern names one project. Programs and folders keep the
+  /// words `noun` gives. The old "old project copies" stays only in rule titles and lessons.
+  static func cardNoun(_ kind: AutopilotKind, match: [String: [String]]) -> (String, String) {
+    guard kind == .worktree else { return noun(kind, match: match) }
+    guard let name = pinnedRepo(match) else { return ("copy", "copies") }
+    return ("copy of " + name, "copies of " + name)
+  }
 
   /// What a question is about, singular and plural, naming the project when there is one.
   static func noun(_ kind: AutopilotKind, match: [String: [String]]) -> (String, String) {
     let value = { (key: String) in match[key]?.first ?? "" }
-    let project = match["repo"]?.count == 1 && !["", "none"].contains(value("repo")) ? value("repo") : nil
+    let project = pinnedRepo(match)
     switch kind {
     case .worktree:
       return project.map { ("old copy of " + $0, "old copies of " + $0) }
@@ -459,20 +559,19 @@ extension AutopilotPolicy {
     }
   }
 
-  /// A pattern's facts in two to four words each, most decisive first.
-  static func facts(_ kind: AutopilotKind, match: [String: [String]]) -> [String] {
-    let table: [(String, [String: String])]
+  /// The facts cards and lessons name, most decisive first, with each value in two to four words.
+  static func factWords(_ kind: AutopilotKind) -> [(fact: String, words: [String: String])] {
     switch kind {
     case .worktree:
-      table = [
+      return [
         ("saved", ["merged": "Already merged", "pushed": "Saved on GitHub", "local": "Work only on this Mac"]),
-        ("changes", ["none": "No unsaved changes", "small": "Has unsaved changes", "large": "Has unsaved changes"]),
+        ("changes", ["none": "No unsaved changes", "small": "Has unsaved changes", "large": "Has lots of unsaved changes"]),
         ("stale", stalePhrases),
         ("place", ["patrol6": "Made by Patrol6 agents", "codex": "Made by Codex", "claude": "Made by Claude", "conductor": "Made by Conductor"]),
         ("thread", ["ended": "Its chat is finished"]),
       ]
     case .process:
-      table = [
+      return [
         ("listening", ["yes": "Still running a server", "no": "Not serving anything"]),
         ("idle", ["active": "Still busy", "10m": "Idle 10+ minutes", "1h": "Idle 1+ hour", "6h": "Idle 6+ hours", "1d": "Idle 1+ day"]),
         ("orphaned", ["yes": "Its app is gone"]),
@@ -480,29 +579,119 @@ extension AutopilotPolicy {
         ("agent", ["codex": "Started by Codex", "claude": "Started by Claude", "cursor": "Started by Cursor"]),
       ]
     case .disk:
-      table = [
+      return [
         ("stale", stalePhrases),
         ("home", ["stale-worktree": "Inside old project copies", "repo": "Inside your projects"]),
       ]
     }
-    return table.compactMap { key, words in match[key]?.first.flatMap { words[$0] } }
   }
 
-  /// "14.4 GB" or "300 MB": one decimal is plenty for deciding.
-  static func roughly(_ bytes: UInt64) -> String {
+  /// A pattern's facts in two to four words each, most decisive first: a card's chips, by the first
+  /// value of each fact.
+  static func facts(_ kind: AutopilotKind, match: [String: [String]]) -> [String] {
+    factWords(kind).compactMap { row in match[row.fact]?.first.flatMap { row.words[$0] } }
+  }
+
+  /// A fact BZ couldn't check, as a lesson names it.
+  static let uncheckedWords: [String: String] = [
+    "saved": "Where its work is saved couldn't be checked",
+    "changes": "Unsaved changes couldn't be checked",
+    "inUse": "Couldn't check if it's in use",
+    "listening": "Its port couldn't be checked",
+  ]
+
+  /// What a lesson's facts cover, naming every value of each, so a keep narrowed to the risks its
+  /// card showed never reads as keeping more: "Work only on this Mac or where its work is saved
+  /// couldn't be checked". A lesson tells a few unsaved changes from lots of them, and whether a copy
+  /// is in use is named only when BZ couldn't check it, since a copy in use is never burned.
+  static func lessonFacts(_ kind: AutopilotKind, match: [String: [String]]) -> [String] {
+    var rows: [(fact: String, words: [String: String])] = []
+    for row in factWords(kind) {
+      var words: [String: String] = row.words
+      if row.fact == "changes" { words["small"] = "Has a few unsaved changes" }
+      rows.append((fact: row.fact, words: words))
+      if kind == .worktree && row.fact == "changes" { rows.append((fact: "inUse", words: [:])) }
+    }
+    var described: [String] = []
+    for row in rows {
+      guard let values = match[row.fact] else { continue }
+      if let phrase = lessonPhrase(kind, row.fact, values, row.words) { described.append(phrase) }
+    }
+    return described
+  }
+
+  /// One fact of a lesson in words: each value it allows, joined with "or", and what BZ couldn't
+  /// check last. Small and large unsaved changes together read as unsaved changes. Nil when it allows
+  /// every known value the fact can take, or a value with no words.
+  static func lessonPhrase(
+    _ kind: AutopilotKind, _ fact: String, _ values: [String], _ words: [String: String]
+  ) -> String? {
+    let known: [String] = values.filter { $0 != "unknown" }
+    let risky: [String] = riskFacts[kind]?.first { $0.fact == fact }?.values ?? []
+    let every: [String] = (safety[fact] ?? risky).filter { $0 != "unknown" }
+    if !every.isEmpty && Set(every).isSubset(of: Set(known)) { return nil }
+    var phrases: [String] = []
+    if fact == "changes" && known.contains("large") && known.contains("small") {
+      phrases.append("Has unsaved changes")
+    } else {
+      for value in known {
+        guard let phrase = words[value] else { return nil }
+        if !phrases.contains(phrase) { phrases.append(phrase) }
+      }
+    }
+    if values.contains("unknown") {
+      guard let unchecked = uncheckedWords[fact] else { return nil }
+      phrases.append(unchecked)
+    }
+    guard var text = phrases.first else { return nil }
+    for phrase in phrases.dropFirst() {
+      let first: String = phrase.prefix(1).lowercased()
+      text += " or " + first + phrase.dropFirst()
+    }
+    return text
+  }
+
+  /// A lesson's title in its question's words, for the facts it kept: "Keep: Old project copies ·
+  /// Unused for a week". A keep narrowed to the risks its card showed also names every value of each
+  /// narrowed fact: "… · Work only on this Mac".
+  static func lessonTitle(_ rule: AutopilotRule, question: AutopilotQuestion) -> String {
+    var named: AutopilotQuestion = question
+    // A lesson names only the facts it kept, so its title leaves out what it generalized.
+    named.match = question.match.filter { rule.match[$0.key] != nil }
+    let answer: AutopilotAnswer = rule.verdict == .burn ? .yes : .no
+    let title: String = ruleTitle(named, answer: answer)
+    guard rule.verdict == .keep else { return title }
+    var narrowed: [String: [String]] = [:]
+    for (fact, _) in riskFacts[rule.kind] ?? [] where named.match[fact] == nil {
+      if let values = rule.match[fact] { narrowed[fact] = values }
+    }
+    let words: [String] = lessonFacts(rule.kind, match: narrowed)
+    return ([title] + words).joined(separator: " · ")
+  }
+
+  /// "14.4 GB" or "300 MB": one decimal is plenty for deciding. Public so a tell card says its size
+  /// the way a question card says what it frees.
+  public static func roughly(_ bytes: UInt64) -> String {
     bytes >= 1_000_000_000
       ? String(format: "%.1f GB", Double(bytes) / 1e9) : String(format: "%.0f MB", Double(bytes) / 1e6)
   }
 
-  /// Facts that make burning riskier: work that exists nowhere else, things still in use.
+  /// Facts that make burning riskier: work that exists nowhere else, things still in use. How
+  /// long something sat unused is not one: a card says that in its headline and leaves it out of
+  /// its facts, and only a program with no date lists its idle time here.
   static let cautions: Set<String> = [
-    "Work only on this Mac", "Has unsaved changes", "Unused since yesterday",
+    "Work only on this Mac", "Has unsaved changes", "Has lots of unsaved changes",
     "Still running a server", "Still busy", "Idle 10+ minutes",
   ]
 
-  public static func card(_ question: AutopilotQuestion) -> AutopilotCard {
+  /// The card for a question as it reads at `now`. The headline is "Burn 5 copies you used
+  /// yesterday?": what it covers and when the most recently used of it was used, in calendar words
+  /// for `calendar`, so the same question reads differently tomorrow.
+  public static func card(
+    _ question: AutopilotQuestion, now: Date = Date(), calendar: Calendar = .current
+  ) -> AutopilotCard {
     let one = question.count == 1
-    let (single, plural) = noun(question.kind, match: question.match)
+    let (single, plural) = cardNoun(question.kind, match: question.match)
     let note: String
     switch question.kind {
     case .worktree:
@@ -512,12 +701,24 @@ extension AutopilotPolicy {
     case .process: note = one ? "It just gets asked to quit." : "They just get asked to quit."
     case .disk: note = one ? "Your tools rebuild it when needed." : "Your tools rebuild them when needed."
     }
-    let shown = facts(question.kind, match: question.match)
-    return AutopilotCard(
-      headline: "Burn \(question.count) \(one ? single : plural)?",
+    let age = when(
+      question.kind, newest: question.newest, match: question.match, now: now, calendar: calendar)
+    let words: [String] = ["Burn", String(question.count), one ? single : plural, age]
+    let headline: String = words.filter { !$0.isEmpty }.joined(separator: " ") + "?"
+    // When the headline says how long it sat unused, the facts and cautions don't say it again.
+    var described = question.match
+    if !age.isEmpty, let recency = recencyFacts[question.kind] { described[recency] = nil }
+    let shown = facts(question.kind, match: described)
+    let rows = cardRows(question, now: now, calendar: calendar)
+    var card = AutopilotCard(
+      headline: headline,
       frees: "Frees \(roughly(question.bytes))" + (question.kind == .process ? " of memory" : ""),
       facts: shown + (question.cautions ?? []), note: note,
       yes: one ? "Yes, burn it" : "Yes, burn them", no: one ? "No, keep it" : "No, keep them",
       cautions: shown.filter(cautions.contains) + (question.cautions ?? []))
+    card.line = question.line
+    card.rows = rows
+    card.more = max(0, question.count - rows.count)
+    return card
   }
 }

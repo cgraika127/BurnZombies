@@ -60,6 +60,9 @@ with tempfile.TemporaryDirectory(prefix="bz-ap-", dir="/tmp") as root:
         assert set(tools) == {"autopilot_catalog", "autopilot_inspect", "autopilot_decide",
                               "autopilot_burn", "autopilot_ask", "autopilot_report"}, tools.keys()
         assert tools["autopilot_burn"]["annotations"]["destructiveHint"] is True
+        ask_schema = tools["autopilot_ask"]["inputSchema"]
+        assert "guess" in ask_schema["properties"], ask_schema
+        assert "guess" not in ask_schema.get("required", []), "guess is optional"
 
         error, page = call("autopilot_catalog", {"status": "unsure"})
         assert not error and {i["id"] for i in page["items"]} == {"worktree:fixture-copy", "process:fixture-server"}, page
@@ -89,9 +92,13 @@ with tempfile.TemporaryDirectory(prefix="bz-ap-", dir="/tmp") as root:
         assert error and "already asking" in overlap.get("error", ""), overlap
         error, page = call("autopilot_catalog", {"status": "unsure"})
         native = next(q for q in page["openQuestions"] if q["kind"] == "process")
+        # A guess that isn't yes or no is ignored, not refused.
         error, question = call("autopilot_ask", {"kind": "process", "match": native["match"],
-                                                 "question": "Can I burn leftover dev servers from chats that already finished?"})
+                                                 "question": "Can I burn leftover dev servers from chats that already finished?",
+                                                 "guess": "maybe"})
         assert not error and question["count"] == 1 and question["source"] == "ai", question
+        error, page = call("autopilot_catalog", {"status": "unsure"})
+        assert not error and isinstance(page["lessons"], list), page.keys()
         error, bad = call("autopilot_ask", {"kind": "process", "match": {"family": ["node"]}, "question": "no question mark"})
         assert error, "questions must be questions"
         error, done = call("autopilot_report", {"text": "Burned one old copy; asked about one dev server."})
@@ -118,6 +125,36 @@ with tempfile.TemporaryDirectory(prefix="bz-ap-", dir="/tmp") as root:
         print("PASS autopilot MCP: six tools, compact catalog, inspect, refusal guidance, AI authority, "
               f"{took:.1f}s burn past the 5s socket deadline, listening-server refusal, one question per subject, report "
               "and look-only through the running app")
+    finally:
+        if server:
+            server.terminate()
+            server.wait(timeout=10)
+        fixture.stdin.close()
+        fixture.wait(timeout=30)
+
+# BZ trusts itself on old copies and may act on its own. The AI's question about them is answered by
+# BZ itself, and the AI hears so in JSON, like every other reply.
+with tempfile.TemporaryDirectory(prefix="bz-ap-act-", dir="/tmp") as root:
+    fixture = subprocess.Popen([str(binary / "BurnProof"), "--autopilot-act-fixture", root],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    server = None
+    try:
+        assert line(fixture, 60).strip() == b"READY"
+        env = dict(os.environ, BURNZOMBIES_HOME=root, BURNZOMBIES_AUTOPILOT="1")
+        server = subprocess.Popen([str(binary / "burnzombies-mcp")], env=env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        sequence = 0
+        send("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                            "clientInfo": {"name": "autopilot proof", "version": "1"}})
+        send("notifications/initialized", notification=True)
+        error, page = call("autopilot_catalog", {"status": "unsure"})
+        native = next(q for q in page["openQuestions"] if q["kind"] == "worktree")
+        error, acted = call("autopilot_ask", {"kind": "worktree", "match": {"saved": ["local"], "stale": ["week"]},
+                                              "question": "Can I burn the copies nobody touched this week?",
+                                              "guess": "yes", "replace": native["id"]})
+        assert not error and acted == {
+            "acted": True, "message": "I was sure you'd say yes, so I burned them and will tell the owner."}, acted
+        print("PASS autopilot MCP: when BZ answers the AI's question itself, the reply is JSON saying it acted")
     finally:
         if server:
             server.terminate()

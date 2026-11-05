@@ -79,6 +79,7 @@ func throwsError<T>(_ expression: @autoclosure () throws -> T) {
       ("--autopilot-disk", "Autopilot junk folders and threads", autopilotDiskProof),
       ("--autopilot-process", "Autopilot processes", autopilotProcessProof),
       ("--autopilot-sweep", "Autopilot sweep", autopilotSweepProof),
+      ("--autopilot-learning", "Autopilot learning", autopilotLearningProof),
       ("--autopilot-look-only", "Autopilot look-only", lookOnlyProof),
     ] as [(String, String, () async throws -> Void)] where CommandLine.arguments.contains(flag) {
       do { try await proof() } catch { failTest("\(name): \(error)") }
@@ -112,6 +113,14 @@ func throwsError<T>(_ expression: @autoclosure () throws -> T) {
     }
     if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--autopilot-fixture" {
       do { try await runAutopilotFixture(root: URL(fileURLWithPath: CommandLine.arguments[2])) } catch {
+        print("FAIL: \(error)")
+        exit(1)
+      }
+      exit(0)
+    }
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--autopilot-act-fixture" {
+      let root = URL(fileURLWithPath: CommandLine.arguments[2])
+      do { try await runAutopilotActFixture(root: root) } catch {
         print("FAIL: \(error)")
         exit(1)
       }
@@ -516,6 +525,7 @@ func throwsError<T>(_ expression: @autoclosure () throws -> T) {
     do { try await autopilotDiskProof() } catch { failTest("Autopilot junk folders: \(error)") }
     do { try await autopilotProcessProof() } catch { failTest("Autopilot processes: \(error)") }
     do { try await autopilotSweepProof() } catch { failTest("Autopilot sweep: \(error)") }
+    do { try await autopilotLearningProof() } catch { failTest("Autopilot learning: \(error)") }
     do { try await lookOnlyProof() } catch { failTest("Autopilot look-only: \(error)") }
     for lookOnly in [false, true] {
       do {
@@ -527,7 +537,7 @@ func throwsError<T>(_ expression: @autoclosure () throws -> T) {
     }
     if failures == beforeAutopilot {
       print(
-        "PASS autopilot policy, restorable retirement, junk folders, processes, sweep, look-only and a newcomer's first two minutes, with and without look-only"
+        "PASS autopilot policy, restorable retirement, junk folders, processes, sweep, learning, look-only and a newcomer's first two minutes, with and without look-only"
       )
     }
     let beforeMachine = failures

@@ -102,9 +102,11 @@ func autopilotPolicyProof() throws {
     question: "Can I burn old project copies made by Patrol6 agents?", why: "", examples: [],
     count: 92, bytes: 14_390_000_000)
   let copiesCard = AutopilotPolicy.card(agentCopies)
-  equal(copiesCard.headline, "Burn 92 old project copies?")
+  equal(copiesCard.headline, "Burn 92 copies unused for a week?")
   equal(copiesCard.frees, "Frees 14.4 GB")
-  equal(copiesCard.facts, ["Saved on GitHub", "Unused for a week", "Made by Patrol6 agents"])
+  equal(
+    copiesCard.facts, ["Saved on GitHub", "Made by Patrol6 agents"],
+    "how long they sat unused is in the headline")
   equal(copiesCard.note, "Each one is backed up first, so you can undo it.")
   equal([copiesCard.yes, copiesCard.no], ["Yes, burn them", "No, keep them"])
   equal(copiesCard.cautions, [], "nothing risky about pushed copies left a week")
@@ -113,8 +115,7 @@ func autopilotPolicyProof() throws {
     question: "", why: "", examples: [], count: 2, bytes: 57_300_000_000)
   equal(
     AutopilotPolicy.card(draftCopies).cautions,
-    ["Work only on this Mac", "Has unsaved changes", "Unused since yesterday"],
-    "what makes burning riskier stands out")
+    ["Work only on this Mac", "Has unsaved changes"], "what makes burning riskier stands out")
   let lonelyServer = AutopilotQuestion(
     kind: .process, match: ["family": ["node"], "idle": ["1d"], "listening": ["yes"]],
     question: "", why: "", examples: [], count: 1, bytes: 3_200_000_000)
@@ -128,8 +129,8 @@ func autopilotPolicyProof() throws {
     kind: .disk, match: ["folder": ["package-cache"], "home": ["global-cache"], "stale": ["day"]],
     question: "", why: "", examples: [], count: 5, bytes: 20_290_000_000)
   let cachesCard = AutopilotPolicy.card(caches)
-  equal(cachesCard.headline, "Burn 5 tool caches?")
-  equal(cachesCard.facts, ["Unused since yesterday"])
+  equal(cachesCard.headline, "Burn 5 tool caches unused since yesterday?")
+  equal(cachesCard.facts, [], "its age is in the headline")
   equal(cachesCard.note, "Your tools rebuild them when needed.")
   equal(
     AutopilotPolicy.ruleTitle(agentCopies, answer: .yes),
@@ -142,10 +143,12 @@ func autopilotPolicyProof() throws {
     kind: .worktree,
     match: ["repo": ["frontier-rpg"], "changes": ["large"], "stale": ["day"], "place": ["other"]],
     question: "", why: "", examples: [], count: 2, bytes: 3_200_000_000)
-  equal(AutopilotPolicy.card(gameCopies).headline, "Burn 2 old copies of frontier-rpg?")
+  equal(
+    AutopilotPolicy.card(gameCopies).headline,
+    "Burn 2 copies of frontier-rpg unused since yesterday?")
   equal(
     AutopilotPolicy.ruleTitle(gameCopies, answer: .yes),
-    "Burn: Old copies of frontier-rpg · Has unsaved changes · Unused since yesterday")
+    "Burn: Old copies of frontier-rpg · Has lots of unsaved changes · Unused since yesterday")
   let orbitServers = AutopilotQuestion(
     kind: .process, match: ["family": ["node"], "repo": ["orbit-web"], "idle": ["1d"]],
     question: "", why: "", examples: [], count: 3, bytes: 3_000_000_000)
@@ -186,11 +189,9 @@ func autopilotPolicyProof() throws {
   equal(single.first?.count, 11, "a yes covers every copy left at least a day")
   equal(single.first?.cautions, ["2 have work only on this Mac", "2 have unsaved changes"])
   let singleCard = AutopilotPolicy.card(single.first!)
-  equal(singleCard.headline, "Burn 11 old project copies?")
-  equal(
-    singleCard.facts,
-    ["Unused since yesterday", "2 have work only on this Mac", "2 have unsaved changes"])
-  equal(singleCard.cautions, singleCard.facts, "all three need care")
+  equal(singleCard.headline, "Burn 11 copies unused since yesterday?")
+  equal(singleCard.facts, ["2 have work only on this Mac", "2 have unsaved changes"])
+  equal(singleCard.cautions, singleCard.facts, "both need care")
   // A no keeps the recent ones; the next question is about the older copies only.
   var declined = AutopilotMemory()
   declined.questions = single
@@ -350,10 +351,13 @@ func autopilotPolicyProof() throws {
   checkFalse(
     AutopilotPolicy.proposeQuestions(unsure, memory: memory).map(\.id).contains(questions[1].id),
     "skipped pattern hidden until its snooze ends")
-  check(
-    AutopilotPolicy.proposeQuestions(
-      unsure, memory: memory, now: Date().addingTimeInterval(2 * 86400)
-    ).map(\.id).contains(questions[1].id), "snooze expiry allows re-asking")
+  // Asked again once the snooze ends, under an id of its own: an answer must land on the new card,
+  // never on the skipped one.
+  let reasked: [String] = AutopilotPolicy.proposeQuestions(
+    unsure, memory: memory, now: Date().addingTimeInterval(2 * 86400)
+  ).map(\.id)
+  check(reasked.contains(questions[1].id + "#2"), "snooze expiry allows re-asking: \(reasked)")
+  checkFalse(reasked.contains(questions[1].id), "never under the skipped question's id")
 
   // Training progress and coverage.
   memory = AutopilotMemory()

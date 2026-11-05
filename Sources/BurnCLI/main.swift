@@ -141,8 +141,9 @@ do {
       )
     }
   case "autopilot":
-    // `burnzombies autopilot [snapshot|catalog|inspect ID|burn ID...|sweep|look-only]`, or one
-    // AutopilotRequest JSON object on stdin with `burnzombies autopilot -`.
+    // `burnzombies autopilot [snapshot|catalog|inspect ID|burn ID...|sweep|eval [--json]|look-only]`,
+    // or one AutopilotRequest JSON object on stdin with `burnzombies autopilot -`. Every one but
+    // look-only is answered by the running app; none starts a tick.
     if args.count == 2, args[1] == "look-only" {
       // Works with the app stopped too, so the installer can use it without AI setup.
       try Autopilot.setLookOnly(true)
@@ -166,8 +167,16 @@ do {
     let body = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
     let raw = try await AgentConnection.callAsync(AgentRequest("autopilot", payload: body))
     let object = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]
-    print((object?["payload"] as? String) ?? raw)
-    if object?["ok"] as? Bool != true { exit(1) }
+    let payload = (object?["payload"] as? String) ?? raw
+    let ok = object?["ok"] as? Bool == true
+    // The replay of the owner's answers reads as a line per answer and a summary, unless asked
+    // for JSON.
+    if request.tool == "eval", ok, !args.contains("--json") {
+      print(AutopilotEval.report(try AutopilotEval.replay(json: Data(payload.utf8))))
+    } else {
+      print(payload)
+    }
+    if !ok { exit(1) }
   case "review-codex":
     guard args.count == 2 || (args.count == 3 && args[2] == "--probe") else {
       fail("Internal Codex review requires a private plan.")

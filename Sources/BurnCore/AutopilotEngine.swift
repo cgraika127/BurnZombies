@@ -72,9 +72,26 @@ public struct AutopilotCatalogItem: Codable, Sendable {
   public var why: String?
 }
 
+/// One of the owner's lessons as the AI reads it (spec 2.6): the sentence Settings shows for a
+/// group of lessons, their ids and exact matches, how many of the owner's answers they rest on, and
+/// what they burned, freed and the owner undid.
+public struct AutopilotCatalogLesson: Codable, Sendable {
+  public var ids: [String]
+  public var sentence: String
+  public var kind: AutopilotKind
+  public var verdict: AutopilotVerdict
+  public var matches: [[String: [String]]]
+  public var answers: Int
+  public var burned: Int
+  public var bytes: UInt64
+  public var undone: Int
+}
+
 public struct AutopilotCatalogPage: Codable, Sendable {
   public var summary: [String: String]
   public var rules: [AutopilotRule]
+  /// The owner's lessons, one per group Settings shows: the AI's brief.
+  public var lessons: [AutopilotCatalogLesson]
   public var openQuestions: [AutopilotQuestion]
   public var answered: [AutopilotQuestion]
   public var items: [AutopilotCatalogItem]
@@ -93,8 +110,11 @@ public actor Autopilot {
   let minimumBytes: UInt64
   var catalog: AutopilotCatalog?
   var delivery: [String: AutopilotDelivery] = [:]
-  var burning = Set<String>()
+  /// Items burning right now, by id, with the authority each burns under.
+  var burning: [String: String] = [:]
   var ticking = false
+  /// Tells being undone: restores wait on Git, and a second Undo meanwhile would restore again.
+  var undoing = Set<String>()
 
   public init(
     root: URL = Store.defaultRoot, sources: AutopilotSources,
@@ -104,6 +124,9 @@ public actor Autopilot {
     self.sources = sources
     self.minimumBytes = minimumBytes
     catalog = try? store.catalog()
+    // Memory from before lessons migrates now, before a tick changes a receipt: its tallies are
+    // seeded from receipts.json as it stands, and each later burn counts as it is recorded.
+    _ = try? store.memory()
     try? store.refreshImpact()
   }
 
@@ -132,12 +155,26 @@ public actor Autopilot {
       observedAt: now, items: items, threads: threads, coverageNotes: sources.coverageNotes())
     try? store.save(catalog: catalog!)
     await refreshReceipts()
-    if burn, (try? store.sweep().enabled) ?? true { await burnAuthorized(now: now) }
-    refreshQuestions(now: now)
+    let canBurn = burn && burnsOnItsOwn()
+    var used: [AutopilotKind: Int] = [:]
+    if canBurn { used = await burnAuthorized(now: now) }
+    // What BZ answers itself burns right away, through the same pass as an answer's matches and
+    // within the bound this look's other burns already count toward. Asked again after that pass:
+    // look-only or Autopilot off switched on while it ran stops this look acting too.
+    let acted = refreshQuestions(now: now, acting: canBurn && burnsOnItsOwn())
+    if !acted.isEmpty { await burnAuthorized(now: now, used: used, settling: acted) }
     return snapshot(now: now)
   }
 
   func memory() -> AutopilotMemory { (try? store.memory()) ?? AutopilotMemory() }
+
+  /// Whether Autopilot is switched on. Off, it catalogs and asks but burns nothing on its own.
+  func enabled() -> Bool { (try? store.sweep().enabled) ?? true }
+
+  /// Whether BZ burns on its own right now: Autopilot is on and not look-only. Only then does it
+  /// act on a question it is sure of; otherwise it asks, so no tell says it burned what is still
+  /// there.
+  func burnsOnItsOwn() -> Bool { enabled() && !holdsBurns() }
 
   /// People remember chats by name: mention the last chat that worked in an old copy.
   static func mentionChat(_ item: AutopilotItem, threads: [AgentThread], now: Date)
@@ -196,27 +233,64 @@ public actor Autopilot {
     return sweep.lookOnly == true
   }
 
+  /// What a second burn of an item hears while the first is still under way.
+  static let alreadyBurning = "I'm already burning it."
+
   /// What the AI hears when it asks to burn something while look-only is on.
   static let lookOnlyHold =
     "Look-only: the owner hasn't turned burning on, so nothing burns yet. Your verdicts are kept and burn once they do; don't burn again this sweep."
 
-  /// Burns every item the policy authorizes now, bounded per kind.
-  func burnAuthorized(now: Date) async {
-    guard let items = catalog?.items, !holdsBurns() else { return }
-    let memory = memory()
+  /// Burns every item the policy authorizes now, at most `maximumBurns` of each kind in one look:
+  /// `used` brings what the look's earlier passes burned, and the new counts come back. Each item
+  /// is decided again on memory and receipts as they are right before it burns, so an Undo or an
+  /// answer that lands while a pass waits on Git wins, and nothing another pass just burned is
+  /// tried again. Then open tells say what their lessons burned; `settling` names tells whose act's
+  /// own pass this is. Look-only holds the whole pass.
+  @discardableResult func burnAuthorized(
+    now: Date, used start: [AutopilotKind: Int] = [:], settling: Set<String> = []
+  ) async -> [AutopilotKind: Int] {
+    guard let items = catalog?.items, !holdsBurns() else {
+      // Look-only switched on after BZ acted: the act's tell says what burned, which is nothing yet,
+      // and never "Burned 3" for things still there.
+      refreshTells(settling: settling)
+      return start
+    }
+    let early = memory()
     let receipts = (try? store.receipts()) ?? []
     let spent = spent(receipts)
     let refused = Self.standingRefusals(receipts, now: now)
-    var used = [AutopilotKind: Int]()
-    for item in items where !spent.contains(item.id) && !burning.contains(item.id) {
-      let decision = AutopilotPolicy.decide(item, memory: memory)
-      guard decision.status == .burn, let authority = decision.authority,
-        refused[Self.refusalKey(item.id, item.revision, authority)] == nil,
+    var used = start
+    for item in items where !spent.contains(item.id) && burning[item.id] == nil {
+      // A cheap first look, on memory as the pass began.
+      guard AutopilotPolicy.decide(item, memory: early).status == .burn,
         used[item.kind, default: 0] < Self.maximumBurns[item.kind, default: 0]
       else { continue }
+      let memory = memory()
+      let decision = AutopilotPolicy.decide(item, memory: memory)
+      guard decision.status == .burn, let authority = decision.authority,
+        refused[Self.refusalKey(item.id, item.revision, authority)] == nil
+      else { continue }
+      let latest = (try? store.receipts()) ?? []
+      if self.spent(latest).contains(item.id) { continue }
       // Only burns count toward the bound; a refusal frees nothing.
       let receipt = await execute(item, authority: authority, why: why(item, decision, memory))
       if receipt.outcome != "refused" { used[item.kind, default: 0] += 1 }
+    }
+    refreshTells(settling: settling)
+    return used
+  }
+
+  /// Says on each open tell what its lesson burned (`AutopilotPolicy.refreshTells`), writing memory
+  /// only when that changes.
+  func refreshTells(settling: Set<String>) {
+    let current = memory()
+    guard current.tells.contains(where: \.isOpen), let items = catalog?.items else { return }
+    let receipts = (try? store.receipts()) ?? []
+    var updated = current
+    AutopilotPolicy.refreshTells(&updated, receipts: receipts, items: items, settled: settling)
+    guard updated.tells != current.tells else { return }
+    try? store.updateMemory {
+      AutopilotPolicy.refreshTells(&$0, receipts: receipts, items: items, settled: settling)
     }
   }
 
@@ -228,10 +302,11 @@ public actor Autopilot {
     }
     // One burn per item at a time, whoever asks: a second retire of the same copy would rewrite
     // the restore point the first one just verified. The first burn's receipt says how it went.
-    guard burning.insert(item.id).inserted else {
-      return .refused(item, authority: authority, "I'm already burning it.")
+    guard burning[item.id] == nil else {
+      return .refused(item, authority: authority, Self.alreadyBurning)
     }
-    defer { burning.remove(item.id) }
+    burning[item.id] = authority
+    defer { burning[item.id] = nil }
     let sources = sources
     var receipt: AutopilotReceipt
     switch item.kind {
@@ -250,7 +325,7 @@ public actor Autopilot {
     case .disk:
       receipt = await Task.detached { sources.reclaimDisk(item, authority) }.value
     }
-    try? store.append(receipt)
+    if (try? store.append(receipt)) != nil { tally([receipt]) }
     let verb = receipt.outcome == "refused" ? "Skipped" : "Burned"
     try? store.updateSweep {
       $0.append(
@@ -274,20 +349,40 @@ public actor Autopilot {
       }
     }
     guard !updates.isEmpty else { return }
-    try? store.updateReceipts { all in
-      for i in all.indices {
-        if let (outcome, detail) = updates[all[i].id] {
+    var stopped = [AutopilotReceipt]()
+    do {
+      try store.updateReceipts { all in
+        for i in all.indices where all[i].outcome == "verifying" {
+          guard let (outcome, detail) = updates[all[i].id] else { continue }
           all[i].outcome = outcome
           all[i].detail = detail
+          if outcome == "burned" { stopped.append(all[i]) }
         }
       }
+    } catch { return }
+    // Counted only once saved as burned, so the next tick never counts the same stop again.
+    tally(stopped)
+  }
+
+  /// Counts burns toward the lessons that authorized them, once each, as they are recorded.
+  func tally(_ receipts: [AutopilotReceipt]) {
+    let taught = receipts.filter { $0.outcome == "burned" && $0.authority.hasPrefix("rule:") }
+    guard !taught.isEmpty else { return }
+    try? store.updateMemoryAfterReceipts { memory, seeded in
+      // A migration in this same read counted them from receipts.json already.
+      guard !seeded else { return }
+      for receipt in taught { AutopilotPolicy.tally(receipt, into: &memory) }
     }
   }
 
-  /// Keeps open questions in step with current items and fills free slots.
-  func refreshQuestions(now: Date) {
-    guard let items = catalog?.items else { return }
-    try? store.updateMemory { memory in
+  /// Keeps open questions in step with current items and fills free slots. Each new question gets
+  /// BZ's guess. One BZ is sure of is answered by BZ instead, when `acting` and the owner lets it
+  /// act on its own (spec 3.4); only a question it would ask can become a tell. Returns the tells it
+  /// made, so the caller burns what their lessons authorize. Open tells close after a week.
+  @discardableResult func refreshQuestions(now: Date, acting: Bool) -> Set<String> {
+    guard let items = catalog?.items else { return [] }
+    let acted = try? store.updateMemory { memory -> Set<String> in
+      AutopilotPolicy.expireTells(&memory, now: now)
       let unsure = items.filter { AutopilotPolicy.decide($0, memory: memory).status == .unsure }
       for i in memory.questions.indices where memory.questions[i].isOpen {
         let question = memory.questions[i]
@@ -298,6 +393,9 @@ public actor Autopilot {
         memory.questions[i].examples = Array(
           matching.sorted { $0.bytes > $1.bytes }.prefix(3).map(\.name))
         memory.questions[i].cautions = AutopilotPolicy.mix(question.kind, matching)
+        // What the card names follows too: the rows, when they were last used, the risks and the
+        // safe line.
+        AutopilotPolicy.describe(&memory.questions[i], covering: matching)
       }
       // Once burns shrink a pattern below what a question is worth, it stops being asked.
       memory.questions.removeAll { $0.isOpen && $0.bytes < AutopilotPolicy.worthAsking }
@@ -311,8 +409,20 @@ public actor Autopilot {
           .filter { subjects.insert(AutopilotPolicy.subject($0.kind, $0.match)).inserted }
           .map(\.id))
       memory.questions.removeAll { $0.isOpen && !kept.contains($0.id) }
-      memory.questions += AutopilotPolicy.proposeQuestions(unsure, memory: memory, now: now)
+      var acted = Set<String>()
+      for var question in AutopilotPolicy.proposeQuestions(unsure, memory: memory, now: now) {
+        question.guess = AutopilotPolicy.guess(question, memory: memory, reaching: unsure)
+        if acting, memory.actsOnItsOwn, let guess = question.guess, guess.sure {
+          // The tell carries the moment BZ acted, not when the look began.
+          let made = AutopilotPolicy.act(question, guess: guess, memory: &memory, at: Date())
+          acted.insert(made.tell.id)
+        } else {
+          memory.questions.append(question)
+        }
+      }
+      return acted
     }
+    return acted ?? []
   }
 
   func why(
@@ -388,13 +498,14 @@ public actor Autopilot {
       result.bytes[entry.status.rawValue, default: 0] += entry.item.bytes
     }
     result.questions = memory.openQuestions.filter { $0.count > 0 }
-    // Rules taught by a question read like its card, even rules taught with older words.
-    let taught = Dictionary(memory.questions.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    // Rules taught by a question read like its card, even rules taught with older words, and a keep
+    // narrowed to some risks names them.
+    let taught = AutopilotPolicy.questionsByID(memory.questions)
     result.rules =
       memory.rules.map { rule in
         guard let question = rule.questionID.flatMap({ taught[$0] }) else { return rule }
         var shown = rule
-        shown.title = AutopilotPolicy.ruleTitle(question, answer: rule.verdict == .burn ? .yes : .no)
+        shown.title = AutopilotPolicy.lessonTitle(rule, question: question)
         return shown
       }
       + AutopilotPolicy.starterRules.map { rule in
@@ -409,6 +520,11 @@ public actor Autopilot {
     result.receipts = Array(receipts.suffix(100).reversed())
     result.coverageNotes = catalog?.coverageNotes ?? []
     result.observedAt = catalog?.observedAt
+    result.lessons = AutopilotPolicy.lessonGroups(memory)
+    result.progress = AutopilotPolicy.progress(
+      memory, receipts: receipts, impact: try? store.impact(), now: now)
+    result.tells = memory.tells.filter(\.waitsForOwner)
+    result.actsOnItsOwn = memory.actsOnItsOwn
     return result
   }
 
@@ -419,8 +535,17 @@ public actor Autopilot {
     switch command {
     case .answer(let id, let answer):
       try store.updateMemory { memory in
-        guard let i = memory.questions.firstIndex(where: { $0.id == id }) else {
+        // The open question with that id, which is the card the owner answered.
+        guard let i = AutopilotPolicy.answering(id, in: memory.questions) else {
           throw StoreError.message("That question is no longer open.")
+        }
+        // A Yes or No stands. The same answer again (a double click) changes nothing, and any
+        // other is refused: relearning would drop what its lesson took in from other answers.
+        if let given = memory.questions[i].answer, given != .skip {
+          guard given == answer else {
+            throw StoreError.message("That question is already answered.")
+          }
+          return
         }
         memory.questions[i].answer = answer
         memory.questions[i].answered = now
@@ -428,19 +553,27 @@ public actor Autopilot {
           memory.questions[i].snoozedUntil = now.addingTimeInterval(86400)
         } else {
           let q = memory.questions[i]
+          // The guess BZ made before asking is checked against the answer, once (spec 3.2).
+          if let guess = q.guess {
+            AutopilotPolicy.score(q, guess: guess.answer, answer: answer, into: &memory, date: now)
+          }
           let verdict: AutopilotVerdict = answer == .yes ? .burn : .keep
-          memory.rules.removeAll { $0.questionID == q.id }
-          memory.rules.append(
-            AutopilotRule(
-              kind: q.kind, match: AutopilotPolicy.widen(q.match, verdict: verdict),
-              verdict: verdict, source: .operator,
-              title: AutopilotPolicy.ruleTitle(q, answer: answer), created: now,
-              questionID: q.id))
+          // The answer teaches why, not which project: a general lesson, titled the same way. Memory
+          // from before re-asked cards had ids of their own can hold a lesson under this id from an
+          // older question: a Yes there gives way to this answer, and a No stays, so nothing the
+          // owner said no to burns.
+          memory.rules.removeAll { $0.questionID == q.id && $0.verdict == .burn }
+          let taught: [AutopilotRule] = AutopilotPolicy.lessons(
+            for: q, verdict: verdict, created: now, earlier: memory.questions)
+          for lesson in taught { AutopilotPolicy.learn(lesson, into: &memory.rules) }
+          // A lesson the new one took in brings its tally along.
+          AutopilotPolicy.carryTallies(&memory)
         }
       }
-      refreshQuestions(now: now)
-      // Show the answer right away; matching items burn in the background.
-      Task { await self.burnAuthorized(now: now) }
+      let acted = refreshQuestions(now: now, acting: burnsOnItsOwn())
+      // Show the answer right away; matching items, and anything BZ just answered itself, burn in
+      // the background.
+      Task { await self.burnAuthorized(now: now, settling: acted) }
     case .burnNow(let id):
       guard let item = catalog?.items.first(where: { $0.id == id }) else {
         throw StoreError.message("I can't find that anymore. It may already be gone.")
@@ -458,27 +591,10 @@ public actor Autopilot {
         if let path { memory.keptItems.insert("path:" + path) }
       }
     case .restore(let receiptID):
-      guard let receipt = try store.receipts().first(where: { $0.id == receiptID }),
-        let restore = receipt.restore
-      else { throw StoreError.message("There's nothing to restore for that one.") }
-      try await Task.detached { [sources] in try sources.restoreWorktree(receipt) }.value
-      try store.updateReceipts { all in
-        if let i = all.firstIndex(where: { $0.id == receiptID }) {
-          all[i].outcome = "restored"
-          all[i].detail = "Restored at \(restore.path)."
-        }
-      }
-      try store.updateMemory {
-        $0.keptItems.insert(receipt.itemID)
-        $0.keptItems.insert("path:" + restore.path)
-      }
+      try await restore(receiptID: receiptID)
     case .forgetRule(let id):
-      try store.updateMemory { memory in
-        if let rule = memory.rules.first(where: { $0.id == id }), let q = rule.questionID {
-          memory.questions.removeAll { $0.id == q }
-        }
-        memory.rules.removeAll { $0.id == id }
-      }
+      // Every answer the lesson was made from goes too, so those things can be asked again.
+      try store.updateMemory { try AutopilotPolicy.forget([id], memory: &$0) }
     case .setStarter(let id, let enabled):
       try store.updateMemory { memory in
         if enabled { memory.starterDisabled.remove(id) } else { memory.starterDisabled.insert(id) }
@@ -500,14 +616,88 @@ public actor Autopilot {
     case .resetTraining:
       try store.updateMemory { memory in
         let kept = memory.keptItems
+        // Whether BZ may act on its own is the owner's setting, not something it learned.
+        let acts = memory.actsOnItsOwn
         memory = AutopilotMemory()
         memory.keptItems = kept
+        memory.actsOnItsOwn = acts
       }
-      refreshQuestions(now: now)
+      // Nothing is trusted after a reset, so there is nothing to act on.
+      refreshQuestions(now: now, acting: false)
     case .sweepNow:
       try store.updateSweep { $0.requested = true }
+    case .tellGood(let id):
+      try store.updateMemory { try AutopilotPolicy.callGood(id, memory: &$0, now: now) }
+    case .tellUndo(let id):
+      try await undo(tell: id, now: now)
+    case .tellSeen(let id):
+      try store.updateMemory { try AutopilotPolicy.seen(id, memory: &$0) }
+    case .setActsOnItsOwn(let acts):
+      try store.updateMemory { $0.actsOnItsOwn = acts }
+    case .forgetLesson(let ids):
+      try store.updateMemory { try AutopilotPolicy.forget(ids, memory: &$0) }
     }
     return snapshot(now: now)
+  }
+
+  /// Brings an old copy back from its restore point. The owner keeps it from then on, and the burn
+  /// counts as undone for the lesson that made it.
+  func restore(receiptID: UUID) async throws {
+    guard let receipt = try store.receipts().first(where: { $0.id == receiptID }),
+      let backup = receipt.restore
+    else { throw StoreError.message("There's nothing to restore for that one.") }
+    try await Task.detached { [sources] in try sources.restoreWorktree(receipt) }.value
+    var wasBurned = false
+    try store.updateReceipts { all in
+      if let i = all.firstIndex(where: { $0.id == receiptID }) {
+        wasBurned = all[i].outcome == "burned"
+        all[i].outcome = "restored"
+        all[i].detail = "Restored at \(backup.path)."
+      }
+    }
+    try store.updateMemoryAfterReceipts { memory, seeded in
+      memory.keptItems.insert(receipt.itemID)
+      memory.keptItems.insert("path:" + backup.path)
+      // The burn already counted toward its lesson; restoring it only marks it undone. A
+      // migration in this same read counted the restore from receipts.json already.
+      if wasBurned && !seeded { AutopilotPolicy.undone(receipt, into: &memory) }
+    }
+  }
+
+  /// Undo (spec 3.4), in an order that lets nothing burn after the owner's No. First, before
+  /// anything comes back, the tell is undoing and the act's lesson is a keep, so no pass burns
+  /// under it again; the owner's answer is No and BZ's guess scores wrong. Then any burn under the
+  /// lesson already under way finishes, and every burn the lesson made comes back through the
+  /// owner's own Restore where it can. The lesson and trust flip even when something can't come
+  /// back, and what didn't is noted on the tell. An Undo cut short by a quit is picked up again by
+  /// the next one.
+  func undo(tell id: String, now: Date) async throws {
+    guard !undoing.contains(id) else { throw StoreError.message(AutopilotPolicy.undoingNow) }
+    undoing.insert(id)
+    defer { undoing.remove(id) }
+    let begun = try store.updateMemory { try AutopilotPolicy.beginUndo(id, memory: &$0, now: now) }
+    guard let tell = begun else { return }
+    let authority = "rule:" + tell.ruleID
+    while burning.values.contains(authority) { try? await Task.sleep(nanoseconds: 50_000_000) }
+    var failed = 0
+    var reason: String?
+    var missing = 0
+    for receipt in AutopilotPolicy.burns(of: tell, receipts: try store.receipts()) {
+      guard receipt.outcome == "burned", receipt.restore != nil else {
+        missing += 1
+        continue
+      }
+      do {
+        try await restore(receiptID: receipt.id)
+      } catch {
+        failed += 1
+        if reason == nil { reason = error.localizedDescription }
+      }
+    }
+    // What didn't come back stays on the tell, in Teach BZ, until the owner has read it.
+    let note: String? = AutopilotPolicy.undoNote(
+      kind: tell.kind, failed: failed, reason: reason, missing: missing)
+    try store.updateMemory { try AutopilotPolicy.finishUndo(id, note: note, memory: &$0) }
   }
 
   // MARK: AI reviewer surface
@@ -538,7 +728,8 @@ public actor Autopilot {
     summary["totalItems"] = String(entries.count)
     if snap.sweep.lookOnly == true { summary["lookOnly"] = "true" }
     return AutopilotCatalogPage(
-      summary: summary, rules: snap.rules, openQuestions: snap.questions,
+      summary: summary, rules: snap.rules, lessons: AutopilotPolicy.catalogLessons(memory),
+      openQuestions: snap.questions,
       answered: Array(
         memory.questions.filter { $0.answer == .yes || $0.answer == .no }.suffix(20)),
       items: page.map { entry in
@@ -598,7 +789,6 @@ public actor Autopilot {
   /// refused for the same facts and authority waits as it does for the native pass: the recorded
   /// reason comes back at once, without checking it again or adding a receipt or a log line.
   public func burn(_ ids: [String]) async -> [AutopilotReceipt] {
-    let memory = memory()
     var receipts = [AutopilotReceipt]()
     for id in ids.prefix(50) {
       guard let item = catalog?.items.first(where: { $0.id == id }) else {
@@ -613,6 +803,13 @@ public actor Autopilot {
         receipts.append(.refused(item, authority: "ai", "Already burned."))
         continue
       }
+      if burning[id] != nil {
+        receipts.append(.refused(item, authority: "ai", Self.alreadyBurning))
+        continue
+      }
+      // Decided on memory as it is right before this burn, as in `burnAuthorized`: an Undo or an
+      // answer that landed while an earlier burn waited on Git wins.
+      let memory = memory()
       let decision = AutopilotPolicy.decide(item, memory: memory)
       guard decision.status == .burn, let authority = decision.authority else {
         receipts.append(
@@ -636,28 +833,41 @@ public actor Autopilot {
     return receipts
   }
 
-  /// Opens a training question. Fails when three are open, unless it replaces one.
-  public func ask(_ question: AutopilotQuestion, replacing: String? = nil) throws
-    -> AutopilotQuestion
-  {
+  /// Opens a training question. Fails when three are open, unless it replaces one. The question
+  /// keeps BZ's guess, with the AI's `guess` when it gives one (yes or no). When BZ is sure, the AI
+  /// expects a yes too and BZ may act on its own, BZ answers it itself exactly as in
+  /// `refreshQuestions` and returns the stored question, answered by BZ; what its lesson authorizes
+  /// burns in the background.
+  public func ask(
+    _ question: AutopilotQuestion, replacing: String? = nil, guess: AutopilotAnswer? = nil
+  ) throws -> AutopilotQuestion {
     let items = catalog?.items ?? []
     guard !question.match.values.contains(where: { $0.contains("unknown") }) else {
       throw StoreError.message(
         "Leave out facts I haven't checked yet (\"unknown\"): an answer about them stops applying once they are checked."
       )
     }
-    return try store.updateMemory { memory in
+    let now = Date()
+    let acting = burnsOnItsOwn()
+    var acted: String?
+    let stored = try store.updateMemory { memory -> AutopilotQuestion in
       if let replacing {
         memory.questions.removeAll { $0.id == replacing && $0.isOpen }
       }
-      // The AI rewording a pattern BZ already asked natively improves that question.
-      if let i = memory.questions.firstIndex(where: {
-        $0.id == question.id && $0.isOpen && $0.source == "native"
+      // The AI rewording a pattern BZ already asked natively improves that question. A native
+      // question's id also names its card's risks, so that the same pattern asked again for new
+      // risks is a question of its own; it is found by its exact pattern instead.
+      if let i = memory.questions.firstIndex(where: { open in
+        guard open.isOpen, open.source == "native", open.kind == question.kind else { return false }
+        return open.match == question.match
       }) {
         memory.questions[i].question = question.question
         if !question.why.isEmpty { memory.questions[i].why = question.why }
         if !question.examples.isEmpty { memory.questions[i].examples = question.examples }
         memory.questions[i].source = "ai"
+        if guess != nil {
+          memory.questions[i].guess = AutopilotPolicy.guess(memory.questions[i].guess, ai: guess)
+        }
         return memory.questions[i]
       }
       guard !memory.questions.contains(where: { $0.id == question.id }) else {
@@ -711,13 +921,24 @@ public actor Autopilot {
       q.count = matching.count
       q.bytes = bytes
       q.cautions = AutopilotPolicy.mix(question.kind, matching)
+      AutopilotPolicy.describe(&q, covering: matching)
       if q.examples.isEmpty {
         q.examples = Array(matching.sorted { $0.bytes > $1.bytes }.prefix(3).map(\.name))
       }
       q.source = "ai"
+      let own = AutopilotPolicy.guess(q, memory: memory, reaching: unsure)
+      q.guess = AutopilotPolicy.guess(own, ai: guess)
+      if acting, memory.actsOnItsOwn, let sure = q.guess, sure.sure {
+        let made = AutopilotPolicy.act(q, guess: sure, memory: &memory, at: Date())
+        acted = made.tell.id
+        return made.question
+      }
       memory.questions.append(q)
       return q
     }
+    // What BZ answered itself burns in the background, as after an owner's Yes.
+    if let acted { Task { await self.burnAuthorized(now: now, settling: [acted]) } }
+    return stored
   }
 
   public func report(_ text: String) throws {
@@ -728,6 +949,13 @@ public actor Autopilot {
   public func updateSweep(_ change: @Sendable (inout AutopilotSweepState) -> Void) {
     try? store.updateSweep { change(&$0) }
   }
+}
+
+/// What the AI hears when BZ answers its question itself: JSON like every other reply, saying that
+/// BZ acted, in a sentence.
+struct AutopilotActedReply: Codable, Sendable {
+  var acted: Bool
+  var message: String
 }
 
 /// A bounded overview for the CLI: the socket reply is capped, so no item lists.
@@ -772,7 +1000,7 @@ public struct AutopilotSummary: Codable, Sendable {
 
 /// One autopilot call from the MCP server or CLI.
 public struct AutopilotRequest: Codable, Sendable {
-  /// `catalog`, `inspect`, `decide`, `burn`, `ask`, `report`, `snapshot` or `command`.
+  /// `catalog`, `inspect`, `decide`, `burn`, `ask`, `report`, `snapshot`, `eval` or `command`.
   public var tool: String
   public var status: String?
   public var kind: String?
@@ -808,6 +1036,8 @@ public struct AutopilotQuestionInput: Codable, Sendable {
   public var question: String
   public var why: String?
   public var examples: [String]?
+  /// What the AI thinks the owner will answer: "yes" or "no". Anything else is ignored.
+  public var guess: String?
   public init(kind: AutopilotKind, match: [String: [String]], question: String) {
     self.kind = kind
     self.match = match
@@ -863,7 +1093,14 @@ extension Autopilot {
         var q = AutopilotQuestion(
           kind: input.kind, match: input.match, question: text, why: input.why ?? "",
           examples: input.examples ?? [], count: 0, bytes: 0, source: "ai")
-        q = try ask(q, replacing: request.replace)
+        // Only yes or no is a guess; anything else is ignored rather than refused.
+        let said: String = input.guess?.lowercased() ?? ""
+        let guess: AutopilotAnswer? = said == "yes" ? .yes : (said == "no" ? .no : nil)
+        q = try ask(q, replacing: request.replace, guess: guess)
+        if q.answeredBy == "bz" {
+          let sentence = "I was sure you'd say yes, so I burned them and will tell the owner."
+          return (true, encode(AutopilotActedReply(acted: true, message: sentence)))
+        }
         if q.why.isEmpty || input.why == nil {
           q.why = "I found \(q.count) like this, using \(AutopilotPolicy.format(q.bytes))."
           let final = q
@@ -879,6 +1116,11 @@ extension Autopilot {
         return (true, encode(["ok": "true"]))
       case "snapshot":
         return (true, encode(AutopilotSummary(snapshot())))
+      case "eval":
+        // `burnzombies autopilot eval`: the replay of the owner's answers, read without a tick.
+        // Memory that can't be read is an error, not a replay of nothing.
+        let questions = try store.memory().questions
+        return (true, encode(AutopilotEval.replay(questions)))
       case "command":
         guard let command = request.command else { return failure("Pass command.") }
         return (true, encode(AutopilotSummary(try await apply(command))))

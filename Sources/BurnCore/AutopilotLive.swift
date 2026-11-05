@@ -10,6 +10,7 @@ extension AutopilotSources {
     junk: AutopilotJunkCache = AutopilotJunkCache()
   ) -> AutopilotSources {
     let sizes = AutopilotSizes()
+    let ages = AutopilotAges(walks: junk.walks)
     let skipped = AutopilotSkipped()
     // Without verified Full Disk Access, Autopilot leaves the places macOS protects alone.
     @Sendable func scope() -> ProtectedLocations { .current(root: root, homes: [home]) }
@@ -42,7 +43,7 @@ extension AutopilotSources {
         // Git checks go only to copies big enough to be worth assessing.
         let worth = sizes.fill(records).filter { $0.allocated >= AutopilotPolicy.worthBytes }
         let items = AutopilotWorktrees.items(
-          worth, threads: threads, delivery: &delivery, budget: 150)
+          ages.fill(worth), threads: threads, delivery: &delivery, budget: 150)
         return (items, delivery)
       },
       disk: { records in junk.items(records, home: home, protected: scope()) },
@@ -124,7 +125,9 @@ public final class AutopilotJunkCache: @unchecked Sendable {
   /// Copies walked since the last full walk, by record, and whether each one was dated then.
   private var walked: [String: Bool] = [:]
   private var running = false
-  private let walks = AutopilotWalks()
+  /// Where its walk is, so a burn never finds BZ inside what it removes. Copies' age looks
+  /// share it.
+  public let walks = AutopilotWalks()
   private let sizer: (String, () -> Bool) -> UInt64?
   /// `sizer` measures one junk folder and gives up as soon as its second argument says to.
   public init(

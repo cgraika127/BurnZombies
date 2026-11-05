@@ -225,6 +225,33 @@ public enum AutopilotWorktrees {
     return AutopilotDelivery(head: head, saved: saved, checked: Date())
   }
 
+  // MARK: Age
+
+  /// When a copy the inventory couldn't walk was last worked in: the newest of its HEAD commit,
+  /// its index (Git rewrites it on add, commit, checkout and reset) and everything in it but
+  /// Git's own data and what is inside its junk folders, whose own times count. Unlike the
+  /// inventory's walk, this one doesn't stop at hard links, projects inside or special files.
+  /// Nil when Git can't say, or the walk can't see everything within `seconds` or `stop` says so
+  /// first: anything partial could only make a copy look older than it is.
+  public static func lastWorked(
+    path: String, seconds: TimeInterval, stop: () -> Bool = { false }
+  ) -> Date? {
+    let deadline = Date().addingTimeInterval(seconds)
+    func ask(_ args: [String]) -> String? {
+      let wait = min(deadline.timeIntervalSinceNow, 180)
+      guard wait > 0.001 else { return nil }
+      return try? line(path, args, seconds: wait)
+    }
+    guard let committed = ask(["log", "-1", "--format=%ct"]), let stamp = TimeInterval(committed),
+      let index = ask(["rev-parse", "--path-format=absolute", "--git-path", "index"]),
+      let files = AutopilotDisk.newestChange(in: path, until: deadline, stop: stop)
+    else { return nil }
+    var newest = max(files, Date(timeIntervalSince1970: stamp))
+    var info = stat()
+    if lstat(index, &info) == 0 { newest = max(newest, AutopilotDisk.changed(info)) }
+    return newest
+  }
+
   // MARK: Retire
 
   /// Removes an old copy only after everything in it is safe: committed work is recorded at
@@ -738,6 +765,77 @@ public final class AutopilotSizes: @unchecked Sendable {
       lock.withLock { known[record.id] = (bytes, now) }
       sized.allocated = bytes
       return sized
+    }
+  }
+}
+
+/// Dates old copies the worktree inventory looked into but couldn't walk (a hard-linked file, a
+/// project inside it or a special file stops its walk), a few per tick, with a look of its own.
+/// Until dated a copy's age is unknown, so no lesson or question reaches it. A date holds for an
+/// hour, or until the inventory sees the copy's HEAD or changes move.
+public final class AutopilotAges: @unchecked Sendable {
+  private struct Look {
+    var date: Date?
+    var at: Date
+    var head: String?
+    var status: String
+  }
+  private let lock = NSLock()
+  private var known: [String: Look] = [:]
+  private let walks: AutopilotWalks?
+  private let prober: (String, TimeInterval, () -> Bool) -> Date?
+  /// With `walks`, the junk walk's, a burn of a copy waits for its look and stops it: the check
+  /// for programs using a copy would otherwise find BZ itself inside. `prober` is told to stop
+  /// through its last argument.
+  public init(
+    walks: AutopilotWalks? = nil,
+    prober: @escaping (String, TimeInterval, () -> Bool) -> Date? = {
+      AutopilotWorktrees.lastWorked(path: $0, seconds: $1, stop: $2)
+    }
+  ) {
+    self.walks = walks
+    self.prober = prober
+  }
+
+  /// Starts no more than `limit` looks, and none once `budget` seconds have passed; each look
+  /// gets 10 seconds, since a cut-short one says nothing. A look that found no date is
+  /// remembered too, so a copy that can't be dated doesn't take every tick's turn; a copy being
+  /// burned isn't looked into, and a look a burn stopped isn't remembered.
+  public func fill(
+    _ records: [WorktreeRecord], limit: Int = 8, budget: TimeInterval = 10, now: Date = Date()
+  ) -> [WorktreeRecord] {
+    let end = ProcessInfo.processInfo.systemUptime + budget
+    let walks = self.walks
+    var looked = 0
+    return records.map { record in
+      // Without a status the inventory never read Git there: it may not look into that folder.
+      guard record.lastFileChange == nil, !record.status.isEmpty, !record.main, !record.missing,
+        !record.retired, !record.bare, record.protectedPlace == nil
+      else {
+        return record
+      }
+      var dated = record
+      if let look = lock.withLock({ known[record.id] }), look.head == record.head,
+        look.status == record.status, now.timeIntervalSince(look.at) < 3600
+      {
+        dated.lastFileChange = look.date
+        return dated
+      }
+      guard looked < limit, ProcessInfo.processInfo.systemUptime < end else { return record }
+      let real = WorkspaceSafety.canonical(record.path)
+      guard walks?.enter(real) ?? true else { return record }
+      looked += 1
+      var early = false
+      let date = prober(record.path, 10) {
+        if !early { early = walks?.wanted(real) ?? false }
+        return early
+      }
+      walks?.leave(real, early: early)
+      guard !early else { return record }
+      let look = Look(date: date, at: now, head: record.head, status: record.status)
+      lock.withLock { known[record.id] = look }
+      dated.lastFileChange = date
+      return dated
     }
   }
 }
